@@ -21,7 +21,7 @@ echo =========================================
 
 if not exist venv (
 echo.
-	echo Installing new environment
+	echo Installing new python environment...
     python -m venv .\venv
 )
 
@@ -52,14 +52,23 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+if errorlevel 0 (
+    echo Installation verified successfully
+)
 
 echo.
 echo ====================================
-echo    Creating necessary directories   
+echo    Verifying necessary directories   
 echo ====================================
 
-if not exist "in" mkdir in
-if not exist "out" mkdir out
+if not exist "in" (
+	echo Creating input folder
+	mkdir in
+)
+if not exist "out" (
+	echo Creating output folder
+	mkdir out
+)
 
 echo.
 echo ============================
