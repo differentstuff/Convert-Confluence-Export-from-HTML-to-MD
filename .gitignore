@@ -1,4 +1,12 @@
-in/
-out/
+# env
 venv/
 .git/
+.vscode/
+__pycache__/*
+
+# dirs
+in/
+out/
+out*/
+in*/
+
