@@ -21,7 +21,7 @@ echo =========================================
 
 if not exist venv (
 echo.
-	echo Installing new python environment...
+	echo Installing new environment
     python -m venv .\venv
 )
 
@@ -39,7 +39,7 @@ echo    Installing Python dependencies
 echo ====================================
 echo.
 python -m pip install --upgrade pip
-pip install html2text requests bs4
+pip install html2text requests bs4 lxml
 
 echo.
 echo =============================
@@ -52,23 +52,16 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-if errorlevel 0 (
-    echo Installation verified successfully
-)
 
 echo.
 echo ====================================
-echo    Verifying necessary directories   
+echo    Creating necessary directories   
 echo ====================================
 
-if not exist "in" (
-	echo Creating input folder
-	mkdir in
-)
-if not exist "out" (
-	echo Creating output folder
-	mkdir out
-)
+if not exist "input" mkdir input
+if not exist "input-xml" mkdir input-xml
+if not exist "output" mkdir output
+if not exist "logs" mkdir logs
 
 echo.
 echo ============================
@@ -76,12 +69,14 @@ echo    Installation completed
 echo ============================
 echo.
 echo Directory structure created:
-echo - in/    (place your HTML files here)
-echo - out/   (converted files will appear here)
+echo - input/      (place your HTML files here)
+echo - input-xml/  (optionally: place your XML files here)
+echo - output/     (converted files will appear here)
 echo.
 echo Next steps:
-echo 1. Place your HTML files in the 'in' folder
-echo 2. Run EITHER run.bat OR convert.ps1 to process the files
+echo 1. Place your HTML files in the 'input' folder
+echo 2. Place your XML files in the 'input-xml' folder (optionally, but delivers better results)
+echo 3. Run EITHER run.bat OR convert.ps1 to process the files
 
 pause
 exit /b 0

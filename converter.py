@@ -1,22 +1,18 @@
 import os
+import io
 import sys
 import logging
-import shutil
-import html2text
 import re
-import requests
-from typing import Set, Tuple, List
 import argparse
-from dataclasses import dataclass
+import html2text
 from bs4 import BeautifulSoup
 
-
-# CONSTANTS REGEX (DO NOT CHANGE)
-FILENAME_PATTERN = re.compile(r'^(.+)_(\d+)(\.md)$')
-UNDERSCORE_DIGITS_PATTERN = re.compile(r'_\d+$')
-LINK_PATTERN = re.compile(r'\[([^\]]+)\]\(<?([^>)]+)>?\)')
-URL_PATTERN = re.compile(r'\[([^\]]+)\]\((https?://[^)]+)\)')
-INVALID_CHARS = re.compile(r'[+/\\:*?@"<>|^\[\]]')
+from attachmentprocessor import AttachmentProcessor
+from linkchecker import LinkChecker
+from xmlprocessor import XmlProcessor
+from conversionstats import ConversionStats
+from config import Config, load_config
+from confluencetaghandler import convert_custom_tags_to_html
 
 # Define comprehensive multilingual month mapping
 MONTH_PATTERNS = {
@@ -42,741 +38,13 @@ MONTH_PATTERNS = {
     # Dutch
     "Mei": "05", "Mrt": "03", "Okt": "10"
 }
+UNDERSCORE_DIGITS_PATTERN = re.compile(r'_\d+$')
 
-@dataclass
-class Config:
-    CONFLUENCE_BASE_URL: str
-    INPUT_FOLDER: str
-    OUTPUT_FOLDER: str
-    ATTACHMENTS_PATH: str
-    IMAGES_PATH: str
-    STYLES_PATH: str
-    LOG_FOLDER_NAME: str
-    LOG_PATH_NAME: str
-    YAML_HEADER: str
-    SPACE_DETAILS_SECTION: str
-    INVALID_VIDEO_INDICATOR: str
-    RENAME_ALL_FILES: bool
-    LOG_LINK_MAPPING: bool
-    USE_UNDERSCORE_IN_FILENAMES: bool
-    INSERT_YAML_HEADER: bool
-    USE_WIKI_LINKS: bool
-    USE_ESCAPING_FOR_WIKI_LINKS: bool
-    SECTIONS_TO_REMOVE: List[str]
-    THUMBNAILS_TO_REMOVE: List[str]
-    THUMBNAIL_PATH: List[str]
-    PREFIXES: List[str]
-    PREFIXES_TO_REMOVE: List[str]
-
-    # Derived properties
-    LOG_FOLDER: str = None
-    LOG_FILE_NAME: str = None
-    LOG_FILE: str = None
-
-    def __post_init__(self):
-        # Set derived properties
-        self.LOG_FOLDER = os.path.join(self.OUTPUT_FOLDER, self.LOG_FOLDER_NAME)
-        self.LOG_FILE_NAME = f"{self.LOG_PATH_NAME}.log"
-        self.LOG_FILE = os.path.join(self.LOG_FOLDER, self.LOG_FILE_NAME)
-
-        # Create necessary directories
-        os.makedirs(self.LOG_FOLDER, exist_ok=True)
-
-class ConversionStats:
-    def __init__(self):
-        self.total = 0
-        self.processed = 0
-        self.success = 0
-        self.failure = 0
-        self.skipped = 0
-        self.current_phase = ""
-        # Track stats per phase
-        self.phase_stats = {
-            "Preprocessing": {"total": 0, "success": 0, "failure": 0, "skipped": 0},
-            "Converting": {"total": 0, "success": 0, "failure": 0, "skipped": 0},
-            "Fixing links": {"total": 0, "success": 0, "failure": 0, "skipped": 0}
-        }
-
-    def update_progress(self):
-        """Update progress in terminal"""
-        if self.current_phase:
-            if self.current_phase == "Preprocessing":
-                print(f"\rPhase completed - {self.current_phase}", end='', flush=True)
-            else:
-                # Include skipped files in the display
-                total_processed = self.processed + self.skipped
-                print(f"\r{total_processed}/{self.total} completed - {self.current_phase}", end='', flush=True)
-        else:
-            print(f"\r{self.processed}/{self.total} completed", end='', flush=True)
-
-    def set_phase(self, phase: str):
-        """Set current processing phase and reset counters"""
-        self.total = 0
-        self.processed = 0
-        self.success = 0
-        self.failure = 0
-        self.skipped = 0
-        self.current_phase = phase
-        # Initialize phase stats if not already present
-        if phase not in self.phase_stats:
-            self.phase_stats[phase] = {"total": 0, "success": 0, "failure": 0, "skipped": 0}
-        self.update_progress()
-
-    def update_phase_stats(self):
-        """Update stats for the current phase"""
-        if self.current_phase:
-            self.phase_stats[self.current_phase]["total"] = self.total
-            self.phase_stats[self.current_phase]["success"] = self.success
-            self.phase_stats[self.current_phase]["failure"] = self.failure
-            self.phase_stats[self.current_phase]["skipped"] = self.skipped
-
-    def skip_file(self, phase="Preprocessing"):
-        """Track a skipped file"""
-        # Ensure the phase exists in phase_stats
-        if phase not in self.phase_stats:
-            self.phase_stats[phase] = {"total": 0, "success": 0, "failure": 0, "skipped": 0}
-        
-        # If this is the first skipped file for this phase, set the total
-        if self.phase_stats[phase]["total"] == 0:
-            self.phase_stats[phase]["total"] = self.total
-            
-        # Increment the skipped count for this phase
-        self.phase_stats[phase]["skipped"] += 1
-
-        # If we're in the current phase, also update the instance variable
-        if phase == self.current_phase:
-            self.skipped += 1
-        
-    def print_final_report(self):
-        """Print final statistics by phase"""
-        print("- Conversion Summary -")
-
-        # Print stats for each phase
-        for phase, stats in self.phase_stats.items():
-            if stats["total"] > 0 or stats["skipped"] > 0:  # Show phases with activity
-                print(f"\n{phase}:")
-                if stats["total"] > 0:
-                    print(f"  Processed: {stats['total']}")
-                    print(f"  Success: {stats['success']}")
-                    print(f"  Failure: {stats['failure']}")
-                    print(f"  Skipped: {stats['skipped']}")
-
-        print(f"\nSee {config.LOG_FILE} for details.")
-
-class LinkChecker:
-    def __init__(self, config: Config):
-        """Setup logging configuration"""
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.checked_urls: Set[str] = set()
-        self.input_folder = config.INPUT_FOLDER
-        self.output_folder = config.OUTPUT_FOLDER
-        self.renamed_files = {}  # Cache for renamed files
-        self.filename_mapping = {}  # Cache for renamed files reference
-        self.basename_dir_mapping = {}  # Directory-aware mapping for basenames
-        self.file_cache = {}     # Cache for file existence checks
-        
-    def _build_file_cache(self):
-        """Build cache of existing files in input and output directories"""
-        for root, _, files in os.walk(self.output_folder):
-            for file in files:
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, self.output_folder)
-                self.file_cache[rel_path] = full_path
-
-    def extract_image_src(self, html_content: str) -> list:
-        """Extract image sources and metadata from HTML content"""
-        # Use BeautifulSoup for more reliable HTML parsing
-        soup = BeautifulSoup(html_content, 'html.parser')
-        images = []
-
-        for img in soup.find_all('img'):
-            src = img.get('src', '')
-            if src:
-                # Get the correct description from data-linked-resource-default-alias
-                # or fallback to the last part of the src path
-                description = (img.get('data-linked-resource-default-alias') or
-                             src.split('/')[-1])
-                images.append({
-                    'src': src,
-                    'description': description
-                })
-        return images
-
-    def process_video_links(self, html_content: str, markdown_content: str) -> str:
-        """Process video links in markdown content"""
-        # Use BeautifulSoup for HTML parsing
-        soup = BeautifulSoup(html_content, 'html.parser')
-        videos = []
-
-        # Find all video elements in the HTML
-        for video in soup.find_all('video'):
-            src = video.get('src', '')
-            if src:
-                # Extract filename from src path
-                filename = src.split('/')[-1]
-                videos.append({
-                    'src': src,
-                    'filename': filename,
-                    'attachment_path': None  # Will be filled if we find a matching attachment
-                })
-
-        # Check attachments section for video files
-        attachments_section = soup.find('h2', {'id': 'attachments'})
-        if attachments_section:
-            attachment_div = attachments_section.find_next('div', {'class': 'greybox'})
-            if attachment_div:
-                for link in attachment_div.find_all('a'):
-                    href = link.get('href', '')
-                    text = link.text.strip()
-
-                    # Match videos by filename
-                    for video in videos:
-                        if video['filename'] == text:
-                            video['attachment_path'] = href
-                            logger.debug(f"Matched video {text} with attachment {href}")
-                            break
-
-        # Replace the placeholder text with proper wiki links
-        for video in videos:
-            if config.INVALID_VIDEO_INDICATOR in markdown_content:
-                # Use attachment path if available, otherwise use source
-                link_path = video.get('attachment_path') or self.make_relative_path(video['src'])
-                wiki_link = self.convert_wikilink(video['filename'], link_path)
-
-                # Replace just one occurrence of the indicator
-                markdown_content = markdown_content.replace(config.INVALID_VIDEO_INDICATOR, wiki_link, 1)
-                logger.debug(f"Replaced video indicator with link: {wiki_link}")
-
-        return markdown_content
-
-    def is_web_url(self, url: str) -> bool:
-        """
-        Check if the URL is a web URL, excluding internal Confluence URLs
-        Returns False for internal Confluence URLs, True for other web URLs
-        """
-        if url.startswith(config.CONFLUENCE_BASE_URL):
-            return False
-        return url.startswith(('http://', 'https://'))
-
-    def make_relative_path(self, path: str) -> str:
-        """Convert path to relative format"""
-        # Remove any leading slashes or directory references
-        path = path.lstrip('/')
-        # Remove any base URL parts if present
-        if '://' in path:
-            path = path.split('://', 1)[1]
-            if '/' in path:
-                path = path.split('/', 1)[1]
-        return path
- 
-    def verify_local_image(self, src_path: str, current_file_path: str) -> Tuple[str, bool, str]:
-        """Verify a local image path"""
-        # Skip verification for special paths like thumbnails
-        for thumbnail in config.THUMBNAIL_PATH:
-            if thumbnail in src_path:
-                return src_path, True, "Thumbnail path"
-            
-        rel_path = self.make_relative_path(src_path).replace('/', os.sep)
-
-        # Get the current subfolder from the file being processed
-        current_subfolder = os.path.relpath(os.path.dirname(current_file_path), self.output_folder)
-        if current_subfolder != '.':
-            rel_path = os.path.join(current_subfolder, rel_path)
-
-        # Check output folder first (as files should be copied by now)
-        output_path = os.path.normpath(os.path.join(self.output_folder, rel_path))
-        logger.debug(f"Checking output path: {output_path}")
-        if os.path.exists(output_path) and os.path.isfile(output_path):
-            logger.debug(f"Image found in output folder: {output_path}")
-            return rel_path.replace(os.sep, '/'), True, "Local image exists"
-
-        # Fallback to input folder
-        input_path = os.path.normpath(os.path.join(self.input_folder, rel_path))
-        logger.debug(f"Checking input path: {input_path}")
-        if os.path.exists(input_path) and os.path.isfile(input_path):
-            logger.debug(f"Image found in input folder: {input_path}")
-            return rel_path.replace(os.sep, '/'), True, "Local image exists"
-
-        logger.warning(f"Image not found in either location: {rel_path}")
-        return rel_path.replace(os.sep, '/'), False, "Image not found"
-      
-    def verify_web_url(self, url: str) -> Tuple[str, bool, str]:
-        """Verify a web URL"""
-        if url in self.checked_urls:
-            return url, True, "Already checked"
-
-        self.checked_urls.add(url)
-        try:
-            response = self.session.head(url, timeout=10, allow_redirects=True)
-            if response.status_code == 405:  # Method not allowed, try GET
-                response = self.session.get(url, timeout=10)
-
-            is_valid = 200 <= response.status_code < 400
-            status = f"Status: {response.status_code}"
-            return url, is_valid, status
-        except requests.exceptions.RequestException as e:
-            return url, False, f"Error: {str(e)}"
-
-    def process_content(self, html_content: str, markdown_content: str, current_file_path: str) -> Tuple[str, list]:
-        """Process content and verify all links"""
-        results = []
-
-        # Extract and verify image sources from HTML
-        image_sources = self.extract_image_src(html_content)
-        for img in image_sources:
-            src = img['src']
-            description = img['description']
-
-            if self.is_web_url(src):
-                url, is_valid, status = self.verify_web_url(src)
-            else:
-                # Always use relative path for local images
-                url, is_valid, status = self.verify_local_image(src, current_file_path)
-                # Even if verification fails, keep the relative path
-                url = self.make_relative_path(src)
-
-            results.append((url, is_valid, status))
-
-            # Create the correct markdown image link regardless of validity
-            old_pattern = f'\\[.*?\\]\\(<{re.escape(src)}>\\)(?: \\[BROKEN IMAGE\\])?(?: \\(image/[^)]+\\))?'
-            #old_pattern = rf'\[.*?\]\(<{re.escape(src)}>\)'
-
-            new_link = self.convert_wikilink(description, url)
-            markdown_content = re.sub(old_pattern, new_link, markdown_content)
-
-            if not is_valid:
-                logger.warning(f"Image verification failed but keeping link: {url} - {status}")
-
-        # Process web URLs in markdown (unchanged)
-        for match in re.finditer(URL_PATTERN, markdown_content):
-            url = match.group(2)
-            if url not in self.checked_urls:
-                _, is_valid, status = self.verify_web_url(url)
-                results.append((url, is_valid, status))
-
-        return markdown_content, results
-
-    def clean_filename(self, md_output: str) -> str:
-        """
-        Remove numeric suffixes from filename based on configuration:
-        - If RENAME_ALL_FILES is True: Remove all numeric suffixes, renames numeric filenames to their first header.
-        - If False: Only remove when corresponding attachment folder exists
-
-        Example: 'CNC_8355908.md' -> 'CNC.md' (only if '8355908' exists as attachment subfolder)
-        Example: '12345.md' -> 'First Header Title.md' (if RENAME_ALL_FILES is True)
-
-        Args:
-            md_output: The target markdown content
-        """
-        logger.debug(f"Checking filename for cleanup: {md_output}")
-        if md_output in self.renamed_files:
-            return self.renamed_files[md_output]
-
-        # Get the filename and directory path
-        dir_path = os.path.dirname(md_output)
-        filename = os.path.basename(md_output)
-
-        # Regular expression to match filename_numbers.md pattern
-        match = FILENAME_PATTERN.match(filename)
-
-        # Process non-numeric filenames or if header extraction failed
-        if not match:
-            logger.debug(f"No numeric suffix found in filename: {filename}")
-            return md_output
-        
-        # At this point, we have a valid match
-        base_name, number, extension = match.groups()
-
-        # Check if filename is purely numeric (excluding extension)
-        if config.RENAME_ALL_FILES and base_name.isdigit():
-            # For numeric filenames, we need to extract the first H1 header from the HTML file
-            # This will be done in the convert_html_to_md function
-            # For now, we'll just return the original path and handle it later
-            return md_output
-
-        logger.debug(f"base_name before sanitize_filename: {base_name}")
-        # character replacement for "+" placeholders
-        base_name = self.sanitize_filename(base_name)
-        logger.debug(f"base_name after sanitize_filename: {base_name}")
-
-        if config.RENAME_ALL_FILES:
-            # Always rename files that match the pattern
-            new_filename = f"{base_name}{extension}"
-            new_path = os.path.join(dir_path, new_filename)
-            logger.debug(f"Renaming {filename} to {new_filename}")
-        else:
-            # Check in output directory for attachment folder
-            attachment_path = os.path.join(dir_path, config.ATTACHMENTS_PATH, number)
-            if not (os.path.exists(attachment_path) and os.path.isdir(attachment_path)):
-                logger.debug(f"No matching attachment folder found for number: {number}")
-                return md_output
-            new_filename = f"{base_name}{extension}"
-            new_path = os.path.join(dir_path, new_filename)
-            logger.debug(f"Found matching attachment folder. Renaming {filename} to {new_filename}")
-            
-        # If the file already exists, we need to handle it
-        if os.path.exists(new_path):
-            logger.warning(f"Target file {new_filename} already exists. Keeping original name.")
-            return md_output
-
-        try:
-            self.renamed_files[md_output] = new_path
-            logger.info(f"Successfully renamed {filename} to {new_filename}")
-            return new_path
-        except OSError as e:
-            logger.error(f"Failed to rename file {filename}: {str(e)}")
-            return md_output
-
-    def fix_crosslinks(self, markdown_content: str, current_file_path: str) -> str:
-        """
-        Fix internal links in markdown content.
-        Handles numeric suffixes and ensures consistent link formatting.
-        """
-        logger.debug(f"Fixing crosslinks in {current_file_path}")
-
-        # Get the directory of the current file for context
-        current_dir = os.path.dirname(os.path.relpath(current_file_path, self.output_folder))
-
-        def process_link(match):
-            description = match.group(1)
-            link = match.group(2).strip('<>')
-            original_link = link  # Store original for logging
-
-            # Skip if it's a web URL or an attachment/image link
-            if self.is_web_url(link) or config.ATTACHMENTS_PATH in link or config.IMAGES_PATH in link:
-                return match.group(0)
-
-            # Process internal links
-            new_link = link
-
-            # Remove common prefixes
-            for prefix in config.PREFIXES:
-                if new_link.startswith(prefix):
-                    logger.debug(f"Link found for prefix {prefix} to remove: {new_link}")
-                    new_link = new_link[len(prefix):]
-                    # remove URL parameters (everything after '?')
-                    if '?' in new_link:
-                        new_link = new_link.split('?', 1)[0]
-                        # remove URL parameters (everything after '&')
-                    if '&' in new_link:
-                        new_link = new_link.split('&', 1)[0]
-                    logger.debug(f"Link changed to: {new_link}")
-                    break  # Break only if a prefix match was found
-
-            # Remove Link
-            for prefix in config.PREFIXES_TO_REMOVE:
-                base_url_prefix = config.CONFLUENCE_BASE_URL + prefix
-                if new_link.startswith(prefix) or new_link.startswith(base_url_prefix):
-                    logger.debug(f"Link found for prefix {prefix}, {base_url_prefix} to remove: {new_link}")
-                    logger.debug(f"Link found to remove: {new_link}")
-                    new_link = ""
-                    break  # Break only if a prefix match was found
-
-            # Returning empty link if removed
-            if new_link == "":
-                logger.debug(f"Modified Link: {new_link}")
-                return new_link
-
-            # Check if this is a link to index.md or index.html
-            basename = os.path.basename(new_link)
-            if basename in ['index.md', 'index.html']:
-                # Get the directory part of the link
-                link_dir = os.path.dirname(new_link)
-
-                # If link_dir is empty, use the current directory
-                if not link_dir:
-                    link_dir = current_dir
-
-                # Construct the full path to check in mappings
-                full_path = os.path.join(link_dir, basename).replace('\\', '/')
-
-                # Try to find the index file in the same directory
-                if basename in self.basename_dir_mapping:
-                    dir_mappings = self.basename_dir_mapping[basename]
-
-                    # First try exact directory match
-                    if link_dir in dir_mappings:
-                        new_link = dir_mappings[link_dir]
-                        # Extract just the filename if the link is in the same directory
-                        if link_dir == current_dir or not link_dir:
-                            new_link = os.path.basename(new_link)
-                        logger.debug(f"Found directory-specific mapping for index: {link_dir}/{basename} -> {new_link}")
-                        return self.convert_wikilink(description, new_link)
-
-                    # If no exact match but we're in the same directory, try current directory
-                    if current_dir in dir_mappings:
-                        new_link = dir_mappings[current_dir]
-                        # Extract just the filename if the link is in the same directory
-                        new_link = os.path.basename(new_link)
-                        logger.debug(f"Using current directory mapping for index: {current_dir}/{basename} -> {new_link}")
-                        return self.convert_wikilink(description, new_link)
-                    
-                # Check if we have a mapping for this specific index file
-                if full_path in self.filename_mapping:
-                    logger.debug(f"Found match for full_path: {full_path}")
-                    new_link = self.filename_mapping[full_path]
-                    logger.debug(f"Replaced index link with directory context: {link} -> {new_link}")
-                    return self.convert_wikilink(description, new_link)
-
-            # Get base filename without extension
-            base_name = os.path.splitext(os.path.basename(link))[0]
-
-            # Try directory-aware mapping first for non-index files
-            if base_name in self.basename_dir_mapping:
-                dir_mappings = self.basename_dir_mapping[base_name]
-
-                # First check if we have a mapping for the file in the current directory
-                if current_dir in dir_mappings:
-                    new_link = dir_mappings[current_dir]
-                    # Extract just the filename if the link is in the same directory
-                    new_link = os.path.basename(new_link)
-                    logger.debug(f"Found directory-specific mapping: {current_dir}/{base_name} -> {new_link}")
-                    return self.convert_wikilink(description, new_link)
-
-            # Fall back to regular mapping if directory-specific mapping not found
-            if new_link in self.filename_mapping:
-                logger.debug(f"Found match for new_link: {new_link}")
-                new_link = self.filename_mapping[new_link]
-                # Check if the target is in the same directory
-                target_dir = os.path.dirname(new_link)
-                if target_dir == current_dir or not target_dir:
-                    new_link = os.path.basename(new_link)
-                logger.debug(f"Direct mapping found for: {original_link} -> {new_link}")
-                return self.convert_wikilink(description, new_link)
-
-            # Try with .md extension explicitly
-            md_link = f"{base_name}.md"
-            if md_link in self.filename_mapping:
-                logger.debug(f"Found match for md_link: {md_link}")
-                new_link = self.filename_mapping[md_link]
-                # Check if the target is in the same directory
-                target_dir = os.path.dirname(new_link)
-                if target_dir == current_dir or not target_dir:
-                    new_link = os.path.basename(new_link)
-                logger.debug(f"MD mapping found for: {original_link} -> {new_link}")
-                return self.convert_wikilink(description, new_link)
-
-            # Try with .html extension explicitly
-            html_link = f"{base_name}.html"
-            if html_link in self.filename_mapping:
-                logger.debug(f"Found match for html_link: {html_link}")
-                new_link = self.filename_mapping[html_link]
-                # Check if the target is in the same directory
-                target_dir = os.path.dirname(new_link)
-                if target_dir == current_dir or not target_dir:
-                    new_link = os.path.basename(new_link)
-                logger.debug(f"HTML mapping found for: {original_link} -> {new_link}")
-                return self.convert_wikilink(description, new_link)
-
-            # Try with just the base name (no extension)
-            if base_name in self.filename_mapping:
-                logger.debug(f"Found match for base_name: {base_name}")
-                new_link = self.filename_mapping[base_name]
-                # Check if the target is in the same directory
-                target_dir = os.path.dirname(new_link)
-                if target_dir == current_dir or not target_dir:
-                    new_link = os.path.basename(new_link)
-                logger.debug(f"Base name mapping found for: {original_link} -> {new_link}")
-                return self.convert_wikilink(description, new_link)
-            
-            # If we get here, no mapping was found
-            logger.debug(f"No mapping found for link: {original_link}")
-
-            # character replacement for "+" placeholders
-            base_name = self.sanitize_filename(base_name)
-            
-            # Keep page IDs unchanged but ensure they have .md extension
-            if base_name.isdigit():
-                logger.debug(f"Numeric link found: {base_name}")
-                if f"{base_name}.md" in self.filename_mapping:
-                    logger.debug(f"Found match for base_name: {base_name}")
-                    new_link = self.filename_mapping[f"{base_name}.md"]
-                    # Check if the target is in the same directory
-                    target_dir = os.path.dirname(new_link)
-                    if target_dir == current_dir or not target_dir:
-                        new_link = os.path.basename(new_link)
-                    logger.debug(f"Found mapping for numeric ID: {base_name}.md -> {new_link}")
-                    return self.convert_wikilink(description, new_link)
-                elif f"{base_name}.html" in self.filename_mapping:
-                    logger.debug(f"Found match for {base_name}.html: {base_name}.html")
-                    new_link = self.filename_mapping[f"{base_name}.html"]
-                    # Check if the target is in the same directory
-                    target_dir = os.path.dirname(new_link)
-                    if target_dir == current_dir or not target_dir:
-                        new_link = os.path.basename(new_link)
-                    logger.debug(f"Found mapping for numeric ID: {base_name}.html -> {new_link}")
-                    return self.convert_wikilink(description, new_link)
-                else:
-                    logger.debug(f"No mapping found for numeric ID: {base_name}")
-                    base_name = base_name + ".md"
-                    return self.convert_wikilink(description, base_name)
-
-            # Remove underscore_digits suffix if present
-            if UNDERSCORE_DIGITS_PATTERN.search(base_name):
-                base_name = base_name.rsplit('_', 1)[0]
-
-            # Use file_cache to check existence
-            potential_path = f"{base_name}.md"
-            if potential_path in self.file_cache:
-                # Use just the filename for same-directory links
-                return self.convert_wikilink(description, os.path.basename(potential_path))
-
-            logger.debug(f"Using default link format for: {original_link} -> {base_name}.md")
-            base_name = base_name + ".md"
-            return self.convert_wikilink(description, base_name)
-
-        # Process link with as regex
-        return LINK_PATTERN.sub(process_link, markdown_content)
-
-    def sanitize_filename(self, filename: str) -> str:
-        """
-        Consistently sanitize filenames for Obsidian compatibility.
-
-        Combines regex efficiency with specific character handling for optimal
-        performance and accuracy.
-        """
-        if not filename:
-            logger.debug(f"Could not find a filename to sanitize: '{filename}'")
-            return "unnamed"
-
-        # Replace problematic characters with dashes
-        sanitized = re.sub(INVALID_CHARS, '-', filename)
-
-        # Remove characters that should be eliminated
-        sanitized = re.sub(r'[#,]', '', sanitized)
-
-        # Handle spaces according to configuration
-        if config.USE_UNDERSCORE_IN_FILENAMES:
-            sanitized = sanitized.replace(' ', '_')
-
-        # Trim leading/trailing periods and spaces
-        sanitized = sanitized.strip('. ')
-
-        # Ensure the filename is not empty
-        if not sanitized:
-            logger.debug(f"Could not sanitize filename: '{filename}' -> '{sanitized}'")
-            return "unnamed"
-
-        return sanitized
-
-    def add_filename_mapping(self, old_path, new_path):
-        """
-        Add a mapping from an old filename to a new filename.
-        This is used when files are renamed during the conversion process.
-        """
-        logger.debug(f"Adding filename mapping for: '{new_path}'")
-
-        # Get relative paths for both old and new paths
-        try:
-            old_rel_path = os.path.relpath(old_path, self.output_folder)
-        except ValueError:
-            # If paths are on different drives, use the basename
-            old_rel_path = os.path.basename(old_path)
-
-        try:
-            new_rel_path = os.path.relpath(new_path, self.output_folder)
-        except ValueError:
-            # If paths are on different drives, use the basename
-            new_rel_path = os.path.basename(new_path)
-
-        # Get directory parts for context
-        old_dir = os.path.dirname(old_rel_path)
-        
-        # Add mappings for the basenames as well (for simple links)
-        old_basename = os.path.basename(old_path)
-        new_basename = os.path.basename(new_path)
-
-        # Store directory context for this basename
-        if old_basename not in self.basename_dir_mapping:
-            self.basename_dir_mapping[old_basename] = {}
-        self.basename_dir_mapping[old_basename][old_dir] = new_basename
-        logger.debug(f"Added mapping basename_dir: {old_basename}[{old_dir}] -> {new_basename}")
-
-        # Add mappings for both .html and .md versions of the file
-        old_basename_noext, _ = os.path.splitext(old_basename)
-        
-        # Add mapping for just the basename without extension (for links that might not include extension)
-        if old_basename_noext not in self.basename_dir_mapping:
-            self.basename_dir_mapping[old_basename_noext] = {}
-        self.basename_dir_mapping[old_basename_noext][old_dir] = new_basename
-        logger.debug(f"Added mapping basename_dir: {old_basename_noext}[{old_dir}] -> {new_basename}")
-
-        # Add mapping for .md version with directory context
-        if f"{old_basename_noext}.md" not in self.basename_dir_mapping:
-            self.basename_dir_mapping[f"{old_basename_noext}.md"] = {}
-        self.basename_dir_mapping[f"{old_basename_noext}.md"][old_dir] = new_basename
-        logger.debug(f"Added mapping basename_dir: {old_basename_noext}.md[{old_dir}] -> {new_basename}")
-
-        # Add mapping for .html version with directory context
-        if f"{old_basename_noext}.html" not in self.basename_dir_mapping:
-            self.basename_dir_mapping[f"{old_basename_noext}.html"] = {}
-        self.basename_dir_mapping[f"{old_basename_noext}.html"][old_dir] = new_basename
-        logger.debug(f"Added mapping basename_dir: {old_basename_noext}.html[{old_dir}] -> {new_basename}")
-
-        # Add to the filename mapping
-        self.filename_mapping[old_rel_path] = new_rel_path
-        logger.debug(f"Added mapping new_rel_path: {old_rel_path} -> {new_rel_path}")
-
-        # Also add with normalized slashes for cross-platform compatibility
-        old_rel_path_norm = old_rel_path.replace('\\', '/')
-        new_rel_path_norm = new_rel_path.replace('\\', '/')
-
-        # Add to the filename mapping
-        self.filename_mapping[old_rel_path_norm] = new_rel_path_norm
-        logger.debug(f"Added mapping new_rel_path_norm: {old_rel_path_norm} -> {new_rel_path_norm}")
-
-        # Special handling for index.md files
-        if old_basename == "index.md" or old_basename == "index.html":
-            # Add mappings for various ways index might be referenced
-            # 1. Just the filename - IMPORTANT: Map to basename only, not full path
-            self.filename_mapping["index.md"] = new_basename
-            logger.debug(f"Added mapping index.md: index.md -> {new_basename}")
-            self.filename_mapping["index.html"] = new_basename
-            logger.debug(f"Added mapping index.html: index.html -> {new_basename}")
-
-            # 2. With directory structure - use full path for directory-specific mappings
-            old_dir = os.path.dirname(old_rel_path)
-            if old_dir:
-                # For directory-specific index files, map to the full path
-                self.filename_mapping[f"{old_dir}/index.md"] = new_rel_path
-                logger.debug(f"Added mapping old_dir.md: {old_dir}/index.md -> {new_rel_path}")
-                self.filename_mapping[f"{old_dir}/index.html"] = new_rel_path
-                logger.debug(f"Added mapping old_dir.html: {old_dir}/index.html -> {new_rel_path}")
-                self.filename_mapping[f"{old_dir}\\index.md"] = new_rel_path
-                logger.debug(f"Added mapping old_dir.md: {old_dir}\\index.md -> {new_rel_path}")
-                self.filename_mapping[f"{old_dir}\\index.html"] = new_rel_path
-                logger.debug(f"Added mapping old_dir.html: {old_dir}\\index.html -> {new_rel_path}")
-                
-                # Also add directory-specific mappings to the basename_dir_mapping
-                if "index.md" not in self.basename_dir_mapping:
-                    self.basename_dir_mapping["index.md"] = {}
-                self.basename_dir_mapping["index.md"][old_dir] = new_basename
-                logger.debug(f"Added mapping basename_dir: index.md[{old_dir}] -> {new_basename}")
-
-                if "index.html" not in self.basename_dir_mapping:
-                    self.basename_dir_mapping["index.html"] = {}
-                self.basename_dir_mapping["index.html"][old_dir] = new_basename
-                logger.debug(f"Added mapping basename_dir: index.html[{old_dir}] -> {new_basename}")
-
-    def convert_wikilink(self, description: str, link: str):
-        if config.USE_WIKI_LINKS:
-            # Return Wikilink Link
-            if config.USE_ESCAPING_FOR_WIKI_LINKS:
-                ## Escape "|" as "\\|" to avoid broken tables in MD content
-                return f"[[{link}\\|{description}]]"
-            else:
-                return f"[[{link}|{description}]]"
-        else:
-            # Return regular MD Link
-            return f"[{description}](<{link}>)"
-
-def parse_args():
+def parse_args() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input', default="in", help="Input folder name")
-    parser.add_argument('--output', default="out", help="Output folder name")
+    parser.add_argument('--input', default="input", help="Input folder name for HTML")
+    parser.add_argument('--input-xml', default="input-xml", help="Input folder name for XML")
+    parser.add_argument('--output', default="output", help="Output folder name")
     parser.add_argument('--base-url', default="https://confluence.myCompany.com", help="Confluence Base URL")
     parser.add_argument('--rename-all', action='store_true', help="Rename all files with numeric suffixes")
     parser.add_argument('--use-underscore', action='store_true', help="Replace spaces with underscores in filenames")
@@ -786,16 +54,16 @@ def parse_args():
 def setup_logging(config: Config) -> logging.Logger:
     """Setup logging configuration"""
     logger = logging.getLogger(config.LOG_PATH_NAME)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(getattr(logging, config.LOG_LEVEL_GENERAL.upper()))
     
     # File handler
-    file_handler = logging.FileHandler(config.LOG_FILE)
-    file_handler.setLevel(logging.DEBUG)
+    file_handler = logging.FileHandler(config.LOG_FILE, encoding='utf-8')
+    file_handler.setLevel(getattr(logging, config.LOG_LEVEL_FILES.upper()))
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s'))
 
     # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.ERROR)
+    console_handler = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8'))
+    console_handler.setLevel(getattr(logging, config.LOG_LEVEL_CONSOLE.upper()))
     console_handler.setFormatter(logging.Formatter('%(message)s'))
 
     # Setup logger
@@ -804,7 +72,7 @@ def setup_logging(config: Config) -> logging.Logger:
 
     return logger
 
-def print_status(message, error=False, log_only=False):
+def print_status(message: str, error: bool=False, log_only: bool=False) -> None:
     """Print user-friendly messages to console"""
     if not log_only:
         if error:
@@ -813,27 +81,12 @@ def print_status(message, error=False, log_only=False):
             print(message)
     logger.error(message) if error else logger.info(message)
 
-def copy_directory(src: str, dst: str):
-    """Copy a directory and its contents"""
-    try:
-        if os.path.exists(src):
-            logger.debug(f"Copying directory from {src} to {dst}")
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-            logger.debug(f"Successfully copied directory: {src}")
-            print_status(f"Copied directory: {os.path.basename(src)}")
-        else:
-            logger.debug(f"Source directory does not exist: {src}")
-    except Exception as e:
-        logger.error(f"Failed to copy directory {src}", exc_info=True)
-        print_status(f"Failed to copy directory {os.path.basename(src)}", error=True)
-        raise
-
-def is_special_folder(path: str, config: Config) -> bool:
+def _is_special_folder(path: str, config: Config) -> bool:
     """Check if a path contains any special folder names"""
     special_folders = [config.ATTACHMENTS_PATH, config.IMAGES_PATH, config.STYLES_PATH]
     return any(folder in path.split(os.sep) for folder in special_folders)
 
-def get_special_folder_type(path: str, config: Config) -> str:
+def _get_special_folder_type(path: str, config: Config) -> str:
     """Determine which type of special folder this is"""
     path_parts = path.split(os.sep)
     if config.STYLES_PATH in path_parts:
@@ -844,13 +97,13 @@ def get_special_folder_type(path: str, config: Config) -> str:
         return "images"
     return None
 
-def count_html_files(input_folders: list, config: Config) -> int:
+def _count_html_files(input_folders: list, config: Config) -> int:
     """Count HTML files excluding special folders"""
     total_count = 0
     for input_folder in input_folders:
         for root, _, files in os.walk(input_folder):
             # Skip special folders when counting
-            if is_special_folder(root, config):
+            if _is_special_folder(root, config):
                 continue
 
             # Count HTML files in this directory
@@ -859,358 +112,942 @@ def count_html_files(input_folders: list, config: Config) -> int:
 
     return total_count
 
-def handle_special_folders(root: str, output_dir: str) -> None:
-    """Copy attachments and images folders with their contents"""
-    logger.debug(f"Handling special folders in {root}")
-    try:        
-        # Copy the entire directory structure and files
-        for dir_path, _, filenames in os.walk(root):
-            # Get the relative path from the special folder
-            rel_subpath = os.path.relpath(dir_path, root)
-
-            # Handle the case where rel_subpath is "."
-            if rel_subpath == '.':
-                dst_dir = output_dir
-            else:
-                dst_dir = os.path.join(output_dir, rel_subpath)
-
-            os.makedirs(dst_dir, exist_ok=True)
-
-            # Copy all files in current directory
-            for file in filenames:
-                src_file = os.path.join(dir_path, file)
-                dst_file = os.path.join(dst_dir, file)
-                shutil.copy2(src_file, dst_file)
-                logger.debug(f"Copied: {src_file} -> {dst_file}")
-    except Exception as e:
-        logger.error(f"Failed to handle special folders: {str(e)}")
-        raise
-
-def process_html_files(root: str, files: list, output_dir: str, stats: ConversionStats, config: Config, link_checker: LinkChecker) -> None:
+def _process_html_files(root: str, files: list, output_dir: str, config: Config, link_checker: LinkChecker) -> None:
     """Convert HTML files to Markdown and collect filename mappings"""
     html_files = [f for f in files if f.endswith('.html')]
 
     # Log all HTML files found in this directory
-    logger.debug(f"Found {len(html_files)} HTML files in {root}")
+    logger.info(f"Found {len(html_files)} HTML files in {root}")
+    
     for filename in html_files:
         input_file = os.path.join(root, filename)
         logger.debug(f"Processing HTML file: {input_file}")
 
         # Check if file should be skipped (e.g., in special folders)
-        if is_special_folder(input_file, config):
+        if _is_special_folder(input_file, config):
             logger.info(f"Skipping file in special folder: {input_file}")
-            stats.skip_file("Converting")
+            link_checker.attachment_processor.xml_processor.stats.skip_file("Converting")
             continue
 
-        stats.processed += 1
-        md_output = os.path.join(output_dir, filename[:-5] + ".md")
-        logger.debug(f"Processing file {stats.processed}/{stats.total}: {filename}")
+        link_checker.attachment_processor.xml_processor.stats.processed += 1
+        md_output_name = os.path.join(output_dir, filename[:-5] + ".md")
+
+        logger.info(f"Processing file {link_checker.attachment_processor.xml_processor.stats.processed}/{link_checker.attachment_processor.xml_processor.stats.total}: {filename}")
 
         try:
-            if convert_html_to_md(input_file, md_output, link_checker):
-                stats.success += 1
+            if _convert_html_to_md(input_file, md_output_name, link_checker):
+                link_checker.attachment_processor.xml_processor.stats.success += 1
             else:
-                stats.failure += 1
+                link_checker.attachment_processor.xml_processor.stats.failure += 1
         except Exception as e:
             logger.error(f"Failed to convert {filename}: {str(e)}")
-            stats.failure += 1
+            link_checker.attachment_processor.xml_processor.stats.failure += 1
 
-        stats.update_progress()
+        link_checker.attachment_processor.xml_processor.stats.update_progress()
 
     # Update phase stats after processing
-    stats.update_phase_stats()
+    link_checker.attachment_processor.xml_processor.stats.update_phase_stats()
 
-def convert_html_to_md(html_file, md_output, link_checker: LinkChecker):
-    """Convert HTML to Markdown without fixing crosslinks"""
+def _preprocess_tables(html_content):
+    """Enhanced preprocessing that preserves cell content"""
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    for table in soup.find_all('table'):
+        # Remove any table attributes that might confuse parsers
+        table.attrs = {}
+
+        # Handle nested tables first (major cause of broken tables)
+        nested_tables = table.find_all('table')
+        for nested in nested_tables:
+            # Convert nested table to simple text with separators
+            nested_text = []
+            for nested_row in nested.find_all('tr'):
+                cells = [cell.get_text(strip=True) for cell in nested_row.find_all(['td', 'th'])]
+                if cells:
+                    nested_text.append(' | '.join(cells))
+
+            if nested_text:
+                replacement = soup.new_tag('div')
+                replacement.string = '\n'.join(nested_text)
+                nested.replace_with(replacement)
+
+        # Ensure proper table structure
+        if not table.find('tbody'):
+            tbody = soup.new_tag('tbody')
+            # Move all tr elements to tbody (except those in thead)
+            thead = table.find('thead')
+            for tr in table.find_all('tr', recursive=False):
+                if not thead or tr.parent != thead:
+                    tr.extract()
+                    tbody.append(tr)
+            table.append(tbody)
+
+        # Fix header structure
+        if not table.find('thead'):
+            tbody = table.find('tbody')
+            if tbody and tbody.find('tr'):
+                first_row = tbody.find('tr')
+                # Check if first row looks like a header (has th tags or bold text)
+                has_th = bool(first_row.find('th'))
+                has_bold = bool(first_row.find(['b', 'strong']))
+
+                if has_th or has_bold:
+                    thead = soup.new_tag('thead')
+                    first_row.extract()
+                    thead.append(first_row)
+                    table.insert(0, thead)
+
+                    # Convert all cells in header to th
+                    for cell in first_row.find_all(['td', 'th']):
+                        cell.name = 'th'
+
+        # Fix empty cells and normalize structure WITHOUT touching content
+        for row in table.find_all('tr'):
+            cells = row.find_all(['td', 'th'])
+
+            for cell in cells:
+                # Remove problematic attributes but keep content intact
+                cell.attrs = {}
+
+                # Handle ONLY truly empty cells (no content at all)
+                if not cell.get_text(strip=True) and not cell.find_all():
+                    cell.string = " "
+                # DO NOT modify cells that have content - leave them completely alone
+
+        # Ensure all rows have the same number of columns
+        rows = table.find_all('tr')
+        if rows:
+            max_cols = max(len(row.find_all(['td', 'th'])) for row in rows)
+
+            for row in rows:
+                cells = row.find_all(['td', 'th'])
+                current_cols = len(cells)
+
+                # Add missing cells
+                while current_cols < max_cols:
+                    cell_type = 'th' if row.parent and row.parent.name == 'thead' else 'td'
+                    empty_cell = soup.new_tag(cell_type)
+                    empty_cell.string = " "
+                    row.append(empty_cell)
+                    current_cols += 1
+
+        # Remove any remaining problematic elements within tables (but not in cells)
+        for element in table.find_all(['script', 'style', 'noscript']):
+            element.decompose()
+
+        # Handle colspan/rowspan by simplifying them
+        for cell in table.find_all(['td', 'th']):
+            if cell.get('colspan') or cell.get('rowspan'):
+                # For now, just remove these attributes
+                if 'colspan' in cell.attrs:
+                    del cell.attrs['colspan']
+                if 'rowspan' in cell.attrs:
+                    del cell.attrs['rowspan']
+
+    return str(soup)
+
+def _convert_html_to_markdown(html_content):
+    """Convert HTML to Markdown"""
     try:
-        logger.debug(f"Starting conversion of {html_file}")
-        logger.debug(f"Target output: {md_output}")
+        logger.debug("Starting HTML to Markdown conversion")
+
+        # Configure html2text
+        h = html2text.HTML2Text()
+        h.ignore_links = False
+        h.ignore_images = False
+        h.ignore_tables = False
+        h.body_width = 0
+        h.protect_links = True
+        h.unicode_snob = True
+        h.mark_code = True
+
+        # Enhanced table settings
+        h.pad_tables = True
+        h.single_line_break = False
+        h.wrap_links = False
+        h.wrap_list_items = False
+        h.escape_all = False
+        h.bypass_tables = False
+        h.ignore_emphasis = False
+        h.skip_internal_links = False
+        h.decode_errors = 'ignore'
+        h.default_image_alt = ''
+
+        processed_html = _preprocess_tables(html_content)
+
+        # convert and return
+        return h.handle(processed_html)
+
+    except Exception as e:
+        logger.error(f"Failed to convert HTML to Markdown: {e}")
+        raise Exception(f"HTML to Markdown conversion failed: {e}")
+
+def _convert_html_to_md(html_file: str, md_output_name: str, link_checker: LinkChecker) -> bool:
+    """
+    Convert HTML to Markdown with intelligent filename handling.
+
+    Args:
+        html_file: Path to the HTML file to convert
+        md_output_name: Target path for the Markdown output
+        link_checker: LinkChecker instance for managing filename mappings
+
+    Returns:
+        bool: True if conversion was successful, False otherwise
+    """
+    try:
+        logger.info(f"Starting conversion of {html_file}")
+
+        # Extract page ID and name from filename
+        filename = os.path.basename(html_file)
+
+        # Skipping original index html file
+        if filename == "index.html":
+            logger.debug("Skipping original 'index.html' file. Index will be replaced by actual Homepage.")
+            return True
 
         # Read HTML content
         with open(html_file, 'r', encoding='utf-8') as f:
             html_content = f.read()
         logger.debug(f"HTML file size: {len(html_content)} bytes")
 
-        # Parse with BeautifulSoup
-        soup = BeautifulSoup(html_content, 'html.parser')
+        # Convert HTML to Markdown
+        try:
+            logger.debug("Converting HTML to Markdown")
+            markdown_content = _convert_html_to_markdown(html_content)
+        except Exception as e:
+            logger.error(f"Failed to convert {filename}: {str(e)}")
+            return False
 
-        # Initialize result buffer
-        markdown_sections = []
+        # Extract page ID using the XML processor
+        page_id = link_checker.attachment_processor.xml_processor.get_page_id_by_filename(filename, md_output_name)
 
-        # Process main content (preserving document structure)
-        for section in identify_document_sections(soup):
-            section_type = section["type"]
-            element = section["element"]
+        # Check if it's the new index file
+        space_key = os.path.basename(os.path.dirname(md_output_name))
+        space_info = link_checker.attachment_processor.xml_processor.get_space_by_key(space_key)
+        homePageId = space_info["homePageId"]
+        is_new_index = homePageId == page_id
+        if is_new_index:
+            logger.debug("New index file detected.")
 
-            if section_type == "main_content":
-                # Use html2text for regular content
-                markdown_sections.append(convert_plain_section(element))
+        # Get filename using XML data
+        logger.debug(f"Attempting to get clean name for page '{filename}' from ID: '{page_id}'")
 
-            elif section_type == "greybox":
-                # Direct conversion to wiki links
-                markdown_sections.append(convert_greybox_section(element, link_checker))
+        page_title = link_checker.attachment_processor.xml_processor.get_page_title_by_id(page_id)
+        logger.debug(f"Found new page title: '{page_title}'")
+        final_md_output_name = f"{page_title}.md"
 
-            elif section_type == "video":
-                # Handle video elements
-                markdown_sections.append(convert_video_section(element, link_checker))
+        # Remove header link list (except for index files)
+        if is_new_index:
+            logger.debug(f"Removing embedded icon in home link for: '{final_md_output_name}'")
+            markdown_content = _remove_embedded_icon_in_home_link(markdown_content)
 
-            elif section_type == "image":
-                # Process images with proper paths
-                markdown_sections.append(convert_image_section(element, link_checker, md_output))
+        # For all files
+        logger.debug(f"Removing link list for: '{final_md_output_name}'")
+        markdown_content = _remove_link_list_on_top(markdown_content)
+        
+        if page_title is not None:
+            logger.debug(f"Matching h1 header text with new filename: '{page_title}'")
+            markdown_content = _replace_first_header_name(markdown_content, page_title)
+        else:
+            logger.debug(f"Filename not found in cache - skipping ID: '{page_id}'")
 
-            elif section_type == "table":
-                # Better table handling
-                markdown_sections.append(convert_table_section(element))
+        # Process video links
+        logger.debug("Processing video links")
+        markdown_content = link_checker.process_invalid_video_links(html_content, markdown_content)
 
-            elif section_type == "attachment_section":
-                # Remove unwanted sections
-                if config.SECTIONS_TO_REMOVE:
-                    logger.debug("Removing common unwanted sections")
-                    for section in config.SECTIONS_TO_REMOVE:
-                        element = remove_markdown_section(element, section)
+        # Process images and external links
+        logger.debug(f"Processing images, local attachments, and external links for page ID: '{page_id}'")
+        markdown_content = link_checker.process_images(html_content, markdown_content)
+        markdown_content = link_checker.process_attachment_links(markdown_content)
 
-        # Join sections into complete markdown
-        markdown_content = "\n\n".join(markdown_sections)
+        # Remove Confluence footer
+        markdown_content = _remove_confluence_footer(markdown_content)
 
-        # Still need some post-processing
-        markdown_content = remove_header_link_list(markdown_content)
-        markdown_content = remove_confluence_footer(markdown_content)
-        markdown_content, created_by_line = remove_created_by(markdown_content, return_line=True)
+        # Remove 'Created by' lines
+        markdown_content, _ = _remove_created_by(markdown_content, return_line=True)
 
         # Add YAML header
         if config.YAML_HEADER:
-            if os.path.basename(md_output) == "index.md" or os.path.basename(md_output) == "index.html":
-                markdown_content = insert_yaml_header_md_index(markdown_content, md_output, config)
+            if is_new_index:
+                logger.debug(f"Inserting YAML Header for index: '{final_md_output_name}'")
+                markdown_content = _insert_yaml_header_md_index(markdown_content, page_id, config, link_checker)
             else:
-                markdown_content = insert_yaml_header_md(markdown_content, created_by_line, md_output, config)
+                logger.debug(f"Inserting YAML Header for file: '{final_md_output_name}'")
+                markdown_content = _insert_yaml_header_md(markdown_content, page_id, config, link_checker)
 
-        # Special handling for numeric filenames
-        filename = os.path.basename(md_output)
-        base_name, extension = os.path.splitext(filename)
-        is_numeric_filename = base_name.isdigit()
+        # Remove space details for index files
+        if is_new_index:
+                logger.debug(f"Removing space details for index: '{final_md_output_name}'")
+                markdown_content = _remove_space_details(markdown_content)
 
-        if config.RENAME_ALL_FILES and is_numeric_filename:
-            # Extract the first H1 header from markdown content
-            header_match = re.search(r'^# (.+?)$', markdown_content, re.MULTILINE)
-            if header_match:
-                # Use the header as the new filename
-                header_text = header_match.group(1).strip()
+        # Remove unwanted sections
+        if config.SECTIONS_TO_REMOVE:
+            logger.debug("Removing unwanted sections")
+            for section in config.SECTIONS_TO_REMOVE:
+                markdown_content = _remove_markdown_section(markdown_content, section)
 
-                # Sanitize the header for use as a filename
-                new_base_name = link_checker.sanitize_filename(header_text)
-                new_filename = f"{new_base_name}{extension}"
-                dir_path = os.path.dirname(md_output)
-                new_path = os.path.join(dir_path, new_filename)
-                
-                # Check if we've already renamed a file to this target path
-                rename_conflict = False
-                for original, renamed in link_checker.renamed_files.items():
-                    if renamed == new_path and original != md_output:
-                        rename_conflict = True
-                        break
-
-                if not rename_conflict:
-                    logger.debug(f"Renaming numeric file '{filename}' to '{new_filename}' based on first H1 header")
-                    link_checker.renamed_files[md_output] = new_path
-                    cleaned_md_output = new_path
-                    # Add explicit mapping for the MD file
-                    link_checker.add_filename_mapping(md_output, new_path)
-                    
-                else:
-                    logger.warning(f"Target file '{new_filename}' already mapped. Keeping original name.")
-            else:
-                logger.debug(f"No H1 header found in '{filename}', keeping original name for numeric file")
-
-        new_md_output = cleaned_md_output if cleaned_md_output != md_output else md_output
-
-        # Handle index.md files - rename based on Space Details table, then remove Space Details section from index
-        if os.path.basename(md_output) == "index.md" or os.path.basename(md_output) == "index.html":
-            space_name = extract_space_name(markdown_content)
-            if space_name:
-                sanitized_name = link_checker.sanitize_filename(space_name)
-                dir_path = os.path.dirname(md_output)
-                new_filename = f"_{sanitized_name}.md"
-                new_md_output = os.path.join(dir_path, new_filename)
-
-                # Check if the target file already exists
-                if os.path.exists(new_md_output):
-                    logger.warning(f"Target file {new_filename} already exists. Using original name: {md_output}.")
-                    new_md_output = md_output
-                # Update the link mapping in the link checker
-                link_checker.add_filename_mapping(md_output, new_md_output)
-
-            # Remove Space Details section from index
-            if config.SPACE_DETAILS_SECTION:
-                logger.debug("Removing Space Details sections from index file")
-                markdown_content = remove_space_details(markdown_content)
-
-        # Add mapping for the original HTML file to the final markdown file
-        link_checker.add_filename_mapping(html_file, new_md_output)
+        # Remove unwanted lines
+        if config.LINES_TO_REMOVE:
+            logger.debug("Removing unwanted lines")
+            markdown_content = _remove_markdown_lines(markdown_content, config.LINES_TO_REMOVE)
 
         # Save the markdown with the correct filename
-        logger.debug(f"Saving markdown to: {new_md_output}")
+        logger.debug(f"Saving page id '{page_id}' as filename: '{final_md_output_name}'")
 
         # Ensure the directory exists
-        os.makedirs(os.path.dirname(new_md_output), exist_ok=True)
+        base_dir = os.path.dirname(md_output_name)
+        final_out_path = os.path.join(base_dir, final_md_output_name)
+        os.makedirs(os.path.dirname(final_out_path), exist_ok=True)
 
-        with open(new_md_output, 'w', encoding='utf-8') as f:
+        with open(final_out_path, 'w', encoding='utf-8') as f:
             f.write(markdown_content)
 
-        if not os.path.exists(new_md_output):
-            raise FileNotFoundError(f"Output file not created: {new_md_output}")
+        if not os.path.exists(final_out_path):
+            raise FileNotFoundError(f"Output file not created: {final_out_path}")
 
-        output_size = os.path.getsize(new_md_output)
-        logger.debug(f"Conversion successful. Output file size: {output_size} bytes")
+        output_size = os.path.getsize(final_out_path)
+        logger.info(f"Conversion successful. Output file size: {output_size} bytes")
         return True
 
     except Exception as e:
         logger.error(f"Conversion failed for {html_file}", exc_info=True)
         logger.debug(f"Error details: {str(e)}")
         print_status(f"Failed to convert {os.path.basename(html_file)}", error=True)
-        raise
+        return False
 
-def identify_document_sections(soup):
-    """Identify and categorize sections of a Confluence HTML document"""
-    sections = []
+def _fix_md_crosslinks(output_dir: str, link_checker: LinkChecker) -> None:
+    """
+    Fix cross-references in Markdown files to use ID-based links.
 
-    # Process body content in order
-    for element in soup.body.find_all(recursive=False):
-        # Greybox sections (attachments)
-        if element.name == "div" and element.get("class") and "greybox" in element.get("class"):
-            sections.append({"type": "greybox", "element": element})
+    Args:
+        output_dir (str): The output directory containing Markdown files
+    """
+    logger.info("Fixing cross-links in Markdown files using ID")
 
-        # Video elements
-        elif element.find("video") is not None:
-            sections.append({"type": "video", "element": element})
-
-        # Image elements
-        elif element.name == "img" or element.find("img") is not None:
-            sections.append({"type": "image", "element": element})
-
-        # Table elements
-        elif element.name == "table" or element.find("table") is not None:
-            sections.append({"type": "table", "element": element})
-
-        # Attachments section (to be skipped)
-        elif element.name == "h2" and element.get("id") == "attachments":
-            # Include this and the following div.greybox as one section
-            attachment_section = element
-            next_element = element.find_next_sibling()
-            if next_element and next_element.name == "div" and next_element.get("class") and "greybox" in next_element.get("class"):
-                attachment_section = [element, next_element]
-            sections.append({"type": "attachment_section", "element": attachment_section})
-
-        # Regular content
-        else:
-            sections.append({"type": "main_content", "element": element})
-
-    return sections
-
-def convert_plain_section(element):
-    """Convert regular HTML content to Markdown using html2text"""
-    h = html2text.HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = False
-    h.ignore_tables = False
-    h.body_width = 0
-    h.protect_links = True
-    h.unicode_snob = True
-    h.mark_code = True
-
-    # Convert just this element to string
-    html_str = str(element)
-    return h.handle(html_str)
-
-def convert_greybox_section(element, link_checker: LinkChecker):
-    """Directly convert greybox attachments to wiki links"""
-    result = []
-
-    for link in element.find_all('a'):
-        href = link.get('href', '').strip()
-        text = link.text.strip()
-
-        if href and text and href.startswith('attachments/'):
-            wiki_link = link_checker.convert_wikilink(text, href)
-            result.append(wiki_link)
-
-    return '\n'.join(result)
-
-def convert_video_section(element, link_checker: LinkChecker):
-    return
-
-def convert_image_section(element, link_checker: LinkChecker, md_output):
-    return
-
-def convert_table_section(element):
-    return
-
-def fix_md_crosslinks(output_dir: str, link_checker: LinkChecker, stats: ConversionStats) -> None:
-    """Second pass: Fix all crosslinks in all Markdown files"""
+    # Get all markdown files
     md_files = []
     for root, _, files in os.walk(output_dir):
         for file in files:
             if file.endswith('.md'):
                 md_files.append(os.path.join(root, file))
 
-    stats.total = len(md_files)
-    stats.phase_stats[stats.current_phase]["total"] = stats.total
-    logger.debug(f"Found {stats.total} Markdown files to process for crosslink fixing")
+    # Set up statistics
+    link_checker.attachment_processor.xml_processor.stats.total = len(md_files)
+    link_checker.attachment_processor.xml_processor.stats.processed = 0
+    link_checker.attachment_processor.xml_processor.stats.success = 0
+    link_checker.attachment_processor.xml_processor.stats.failure = 0
+    total_links_fixed = 0
+
+    # Get all Homepage files
+    all_spaces = link_checker.attachment_processor.xml_processor.spaces
+
+    all_homepages = {}
+    for _, space_data in all_spaces.items():
+        homepage_id = space_data["homePageId"]
+        space_name = space_data["name"]
+        title = link_checker.attachment_processor.xml_processor.get_page_title_by_id(homepage_id)
+        all_homepages[title] = {
+            "space_name": space_name,
+            "homepage_id": homepage_id,
+            "title": title
+        }
     
-    # Special debug for numeric links
-    numeric_links_found = []
+    # Create a set of homepage filenames (title + ".md")
+    homepage_filenames = {f"{title}.md" for title in all_homepages}
 
+    # Process each file
     for md_file in md_files:
-        stats.processed += 1
-        try:
-            logger.debug(f"Fixing crosslinks in {md_file}")
+        link_checker.attachment_processor.xml_processor.stats.processed += 1
+        logger.info(f"Processing file {link_checker.attachment_processor.xml_processor.stats.processed}/{link_checker.attachment_processor.xml_processor.stats.total}: {md_file}")
 
-            # Read the markdown content
+        # Get the directory of the current file for context
+        current_dir = os.path.dirname(os.path.relpath(md_file, output_dir))
+
+        # Now check if md_file matches any homepage filename
+        is_index_file = os.path.basename(md_file) in homepage_filenames
+
+        try:
             with open(md_file, 'r', encoding='utf-8') as f:
                 content = f.read()
+            
+            if md_file == 'output\\WER\\Arbeitssicherheit.md':
+                logger.debug(f"Processing specific file: {md_file} with content")
+                #logger.debug(f"--- Start of content ---")
+                #logger.debug(content)
+                #logger.debug(f"--- End of content ---")
 
-            # Debug: Find all numeric links before fixing
-            for match in re.finditer(r'\[([^\]]+)\]\(<?((\d+)\.md)>?\)', content):
-                numeric_links_found.append({
-                    'file': md_file,
-                    'link_text': match.group(1),
-                    'link_target': match.group(2),
-                    'numeric_id': match.group(3)
-                })
+            # Find all markdown links
+            link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 
-            # Fix crosslinks
-            logger.debug(f"Using mapping basename_dir_mapping: {link_checker.basename_dir_mapping}")
-            fixed_content = link_checker.fix_crosslinks(content, md_file)
+            # Create a counter object that can be accessed by the nested function
+            counter = {'links_fixed': 0}
 
-            # Save the file if changes were made
-            if fixed_content != content:
-                with open(md_file, 'w', encoding='utf-8') as f:
-                    f.write(fixed_content)
-                logger.debug(f"Updated crosslinks in {md_file}")
+            def replace_link(match):
+                description = match.group(1)
+                link = match.group(2).strip('<>')
 
-            stats.success += 1
+                # Process the link
+                new_link = _process_link(link, current_dir, link_checker)
+                logger.debug(f"Processed link: '{link}' -> '{new_link}'")
+
+                # Return the updated link
+                if new_link:
+                    counter['links_fixed'] += 1
+                    # tag
+                    if new_link.startswith('#'):
+                        return new_link
+                    # username
+                    elif new_link.startswith('@'):
+                        return new_link
+                    # regular link
+                    else:
+                        if config.BLOGPOST_LINK_REPLACEMENT_ENABLED and description == config.BLOGPOST_LINK_INDICATOR:
+                            new_description = os.path.splitext(os.path.basename(new_link))[0] + config.BLOGPOST_LINK_REPLACEMENT
+                            logger.debug(f"Updated description from '{description}' to: '{new_description}'")
+                            return link_checker.convert_wikilink(new_description, new_link)
+                        return link_checker.convert_wikilink(description, new_link)
+                else:
+                    return description  # Just return the description if link was removed
+
+            # Replace all links
+            updated_content = link_pattern.sub(replace_link, content)
+
+            def fix_label_lines(content):
+                lines = content.splitlines()
+                new_lines = []
+                # Pattern: (indent)(optional tab)(spaces)(asterisk)(spaces)(#label)(rest)
+                label_line_re = re.compile(r'^(\s*)(\t)?(\s*)\*\s+(#\S+)(.*)$')
+
+                for line in lines:
+                    m = label_line_re.match(line)
+                    # replace labels for all pages
+                    if m:
+                        indent = m.group(1)        # leading whitespace
+                        mid_space = m.group(3)     # spaces between tab/indent and asterisk
+                        label = m.group(4)         # the #label
+                        rest = m.group(5)          # anything after the label
+
+                        # remove labels inside homepage
+                        if config.REMOVE_ALL_TAGS_FROM_INDEX and is_index_file:
+                            logger.debug(f"Removing label line in homepage: {line}")
+                            new_line = ""
+                        # Check if rest contains only whitespace/tabs
+                        elif rest.strip():
+                            # Rest contains non-whitespace characters - keep it
+                            new_line = f"- {label}{rest}"
+                            #new_line = f"{indent}{mid_space}- {label}{rest}"
+                            new_lines.append(new_line)
+                            logger.debug(f"Append label: {new_line}")
+                        else:
+                            # Rest is only whitespace/tabs - remove it
+                            #new_line = f"{indent}{mid_space}- {label}"
+                            new_line = f"- {label}"
+                            new_lines.append(new_line)
+                            logger.debug(f"Append label: {new_line}")
+                    # remove special characters
+                    else:
+                        if line.endswith('  · '):
+                            line.replace('  · ','')
+                            logger.debug(f"Removed trailing special character from line: {line}")
+                        new_lines.append(line)
+                return '\n'.join(new_lines)
+
+            # Apply the label line fix
+            updated_content = fix_label_lines(updated_content)
+
+            # Write the updated content
+            with open(md_file, 'w', encoding='utf-8') as f:
+                f.write(updated_content)
+
+            # Get the count from our counter object
+            links_fixed = counter['links_fixed']
+            logger.debug(f"Updated {links_fixed} links in {md_file}")
+            total_links_fixed += links_fixed
+
+            # Update the stats with the number of links fixed
+            if hasattr(link_checker.attachment_processor.xml_processor.stats, 'increment_links_fixed'):
+                link_checker.attachment_processor.xml_processor.stats.increment_links_fixed(links_fixed)
+            elif 'Fixing links' in link_checker.attachment_processor.xml_processor.stats.phase_stats and 'links_fixed' in link_checker.attachment_processor.xml_processor.stats.phase_stats['Fixing links']:
+                link_checker.attachment_processor.xml_processor.stats.phase_stats['Fixing links']['links_fixed'] += links_fixed
+                
+            link_checker.attachment_processor.xml_processor.stats.success += 1
+
         except Exception as e:
-            logger.error(f"Failed to fix crosslinks in {md_file}: {str(e)}")
-            stats.failure += 1
+            logger.error(f"Error fixing links in {md_file}: {str(e)}")
+            link_checker.attachment_processor.xml_processor.stats.failure += 1
 
-        stats.update_progress()
+        link_checker.attachment_processor.xml_processor.stats.update_progress()
 
-    # Log all numeric links found
-    if numeric_links_found:
-        logger.debug(f"=== Found {len(numeric_links_found)} numeric links ===")
-        for link in numeric_links_found:
-            logger.debug(f"File: {link['file']}, Link: [{link['link_text']}]({link['link_target']})")
-            # Check if we have a mapping for this numeric ID
-            if f"{link['numeric_id']}.md" in link_checker.filename_mapping:
-                logger.debug(f"  Mapping exists: {link['numeric_id']}.md -> {link_checker.filename_mapping[f'{link['numeric_id']}.md']}")
-            elif f"{link['numeric_id']}.html" in link_checker.filename_mapping:
-                logger.debug(f"  Mapping exists: {link['numeric_id']}.html -> {link_checker.filename_mapping[f'{link['numeric_id']}.html']}")
+    if link_checker.attachment_processor.xml_processor.stats.processed > 0:
+        avg_links = total_links_fixed / link_checker.attachment_processor.xml_processor.stats.processed
+        logger.info(f"  Average links per file: {avg_links:.2f}")
+    else:
+        logger.info("  No files were processed for link fixing")
+
+    logger.info(f"Link fixing summary:")
+    logger.info(f"  Total files processed: {link_checker.attachment_processor.xml_processor.stats.processed}")
+    logger.info(f"  Total links fixed: {total_links_fixed}")
+    logger.info(f"  Average links per file: {total_links_fixed / link_checker.attachment_processor.xml_processor.stats.processed:.2f}")
+
+def _process_link(link: str, current_dir: str, link_checker: LinkChecker) -> str:
+    """
+    Process a link to convert it to the correct format for markdown.
+
+    Args:
+        link (str): The original link to process
+        current_dir (str): The directory of the current file for context
+
+    Returns:
+        str: The processed link in the correct format for markdown
+    """
+    # Skip if it's an empty link
+    if not link or link.strip() == "":
+        return ""
+
+    logger.debug(f"Processing link: {link}")
+
+    # Handle external links (excluding confluence links)
+    if link.startswith(('http://', 'https://')) and not link.startswith('https://confluence'):
+        logger.debug(f"External link detected: {link}")
+        return link
+
+    # Ignore local file links early
+    if link.startswith("file://"):
+        return link
+
+    # Handle Homepage
+    if link == "index.html":
+        # Try to find the space by key from current directory
+        space_key = current_dir.split(os.sep)[0] if os.sep in current_dir else current_dir
+        logger.debug(f"Looking for home page in space: {space_key}")
+
+        # Try to find the space by key
+        space_info = link_checker.attachment_processor.xml_processor.get_space_by_key(space_key)
+        if space_info and space_info.get("homePageId"):
+            page_id = space_info["homePageId"]
+            page_title = link_checker.attachment_processor.xml_processor.get_page_title_by_id(page_id)
+            if page_title:
+                logger.debug(f"Found home page for space {space_key}: {page_title}")
+                return f"{page_title}.md"
+
+        # If we couldn't find by space key, try all spaces
+        for _, space_info in link_checker.attachment_processor.xml_processor.spaces.items():
+            if space_info.get("homePageId"):
+                page_id = space_info["homePageId"]
+                page_title = link_checker.attachment_processor.xml_processor.get_page_title_by_id(page_id)
+                if page_title:
+                    logger.debug(f"Found home page: {page_title}")
+                    return f"{page_title}.md"
+
+        # Fallback to regular name if all other fail
+        return "index.md"
+
+    # Handle attachments and images
+    if any(pattern in link for pattern in [f'{config.ATTACHMENTS_PATH}/', f'download/{config.ATTACHMENTS_PATH}/']):
+        logger.debug(f"Attachment link detected: '{link}'")
+
+        # Try to extract attachment ID first (most reliable method)
+        attachment_id_match = re.search(r'attachments/\d+/(\d+)|download/attachments/\d+/(\d+)', link)
+        if attachment_id_match:
+            # Group 1 or 2 will contain the ID depending on which pattern matched
+            attachment_id = attachment_id_match.group(1) if attachment_id_match.group(1) else attachment_id_match.group(2)
+            
+            # Look up attachment directly in XML data
+            attachment = link_checker.attachment_processor.xml_processor.get_attachment_by_id(attachment_id)
+            if attachment:
+                # Get the actual parent page ID from the attachment data
+                parent_page_id = attachment.get('containerContent_id')
+                # Get the filename from attachment data
+                attachment_filename = attachment['title']
+                # Get the space key for the parent page
+                space_key = link_checker.attachment_processor.xml_processor.get_space_key_by_page_id(parent_page_id)
+                
+                # Construct the new link path using the actual parent data
+                new_link = f"{space_key}/{config.ATTACHMENTS_PATH}/{parent_page_id}/{attachment_filename}"
+                logger.debug(f"Found attachment by ID: {attachment_id} -> {new_link}")
+                return new_link
+                
+        # Fallback: Extract the actual filename and page ID from the link
+        link_filename = os.path.basename(link.split('?')[0])
+        decoded_filename = link_checker.attachment_processor.xml_processor._sanitize_filename(link_filename)
+        page_id_match = re.search(rf'{config.ATTACHMENTS_PATH}/(\d+)/', link)
+        page_id = page_id_match.group(1) if page_id_match else None
+
+        if page_id:
+            # Try to find attachment by filename in the page's attachments
+            attachments = link_checker.attachment_processor.xml_processor.get_attachments_by_page_id(page_id)
+            for att in attachments:
+                if att.get('title') == link_filename or att.get('title') == decoded_filename:
+                    # Use the actual parent page ID from the attachment data
+                    parent_page_id = att.get('containerContent_id', page_id)
+                    space_key = link_checker.attachment_processor.xml_processor.get_space_key_by_page_id(parent_page_id)
+                    new_link = f"{space_key}/{config.ATTACHMENTS_PATH}/{parent_page_id}/{att['title']}"
+                    logger.debug(f"Found attachment by filename: {link_filename} -> {new_link}")
+                    return new_link
+
+        # Only use file_mapping as last resort if other methods failed
+        if page_id and link_checker.attachment_processor.file_mapping:
+            # Current implementation fallback
+            for orig_path, new_path in link_checker.attachment_processor.file_mapping.items():
+                if page_id in orig_path and (link_filename in os.path.basename(new_path) or decoded_filename in os.path.basename(new_path)):
+                    rel_path = os.path.relpath(new_path, link_checker.attachment_processor.config.OUTPUT_FOLDER)
+                    logger.debug(f"Found in attachment mapping: '{link}' -> '{rel_path}'")
+                    return rel_path.replace(os.sep, '/')
+
+        # If no mapping found or no page ID, try to extract space key from the current directory
+        if current_dir and page_id:
+            # The current_dir might contain the space key
+            space_key = current_dir.split(os.sep)[0] if os.sep in current_dir else current_dir
+            new_path = f"{space_key}/{config.ATTACHMENTS_PATH}/{page_id}/{link_filename}"
+            logger.debug(f"Created relative attachment link: '{link}' -> '{new_path}'")
+            return new_path
+
+        # If still no mapping found, return original link
+        logger.debug(f"No mapping found for attachment link: '{link}'")
+        return link
+
+    # Handle /pages/viewpage.action?pageId=X links
+    if '/pages/viewpage.action' in link and 'pageId=' in link:
+        page_id_match = re.search(r'pageId=(\d+)', link)
+        if page_id_match:
+            page_id = page_id_match.group(1)
+            page_info = link_checker.attachment_processor.xml_processor.get_page_by_id(page_id)
+            if page_info:
+                page_title = page_info.get('title')
+                page_type = page_info.get('type')
+
+                if page_type == 'BlogPost':
+                    # Get space key for this page
+                    space_id = page_info.get("spaceId")
+                    space_info = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+                    if space_info and space_info.get("key"):
+                        target_space_key = space_info.get("key")
+                        # Add space key prefix
+                        logger.debug(f"Found blog post by ID: '{page_id}', title '{page_title}', space '{target_space_key}'")
+                        return f"{target_space_key}/{config.BLOGPOST_PATH}/{page_title}.md"
+                    else:
+                        logger.debug(f"Space key not found for blog post ID '{page_id}'")
+                        return f"{page_title}.md"
+                else:
+                    # Get space key for this page
+                    space_id = page_info.get("spaceId")
+                    space_info = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+                    if space_info and space_info.get("key"):
+                        target_space_key = space_info.get("key")
+                        # Add space key prefix
+                        logger.debug(f"Found page by ID: '{page_id}', title '{page_title}', space '{target_space_key}'")
+                        return f"{target_space_key}/{page_title}.md"
+                    else:
+                        logger.debug(f"Space key not found for page ID '{page_id}'")
+                        return f"{page_title}.md"
             else:
-                logger.debug(f"  No mapping found for {link['numeric_id']}")
-                    
-    # Update phase stats after processing
-    stats.update_phase_stats()
+                logger.debug(f"Could not find page title for ID: '{page_id}'")
+                return link
 
-def remove_header_link_list(markdown_content):
+    # Handle /pages/editblogpost.action?pageId=X links
+    if '/pages/editblogpost.action' in link and 'pageId=' in link:
+        page_id_match = re.search(r'pageId=(\d+)', link)
+        if page_id_match:
+            page_id = page_id_match.group(1)
+            page_info = link_checker.attachment_processor.xml_processor.get_page_by_id(page_id)
+            if page_info:
+                page_title = page_info.get('title')
+                if page_info and page_info.get("spaceId"):
+                    space_id = page_info.get("spaceId")
+                    space_info = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+                    if space_info and space_info.get("key"):
+                        target_space_key = space_info.get("key")
+                        # Add space key prefix
+                        logger.debug(f"Found blog post by ID '{page_id}', title: '{page_title}', space '{target_space_key}'")
+                        new_link =f"{target_space_key}/{config.BLOGPOST_PATH}/{page_title}.md"
+                        return new_link
+                else:
+                    logger.debug(f"Space key not found for page ID '{page_id}'")
+                logger.debug(f"Found blog post by ID '{page_id}', title: '{page_title}'")
+                return f"{page_title}.md"
+            else:
+                logger.debug(f"Could not find blog post title for ID {page_id}")
+
+    # Handle /label/ links (tags)
+    if '/label/' in link:
+        parts = link.split('/')
+        if len(parts) >= 3:
+            tag = parts[-1]
+            return f"#{tag}"
+
+    # Handle /labels/ links (tags) using ID
+    if '/labels/' in link:
+        # Extract label ID from label link
+        label_id_match = re.search(r'ids=(\d+)', link)
+        if label_id_match:
+            label_id = label_id_match.group(1)
+            
+            # Use the new _label_by_id dictionary to look up label name
+            label = link_checker.attachment_processor.xml_processor._label_by_id.get(label_id)
+            if label:
+                return f"#{label['name']}"
+            
+            # Fallback if label not found
+            logger.warning(f"Label with ID {label_id} not found in XML data")
+            return f"#label_{label_id}"
+
+    # Handle user links that start with /display/~username
+    if '/display/~' in link:
+        username = link.split('/display/~')[1].strip()
+        logger.debug(f"User link detected from path: '{username}'")
+        return f"@{username}"
+
+    # Handle /display/ links
+    if '/display/' in link and not '/display/~' in link:
+        #logger.debug(f"Display link detected: '{link}'")
+        parts = link.split('/display/', 1)[1].split('/', 1)
+        if len(parts) == 2:
+            space_key, page_title = parts
+            page_title = page_title.replace('+', ' ')  # Replace '+' with spaces in the page title
+            page_title = link_checker.attachment_processor.xml_processor._sanitize_filename(page_title)
+            
+            # Verify this space and page combination exists in XML data
+            space_info = link_checker.attachment_processor.xml_processor.get_space_by_key(space_key)
+            if space_info:
+                # Try to find the page by title in this space
+                space_id = space_info.get('id')
+                if space_id:
+                    # Look through all pages in this space
+                    for page_id, page_info in link_checker.attachment_processor.xml_processor.page.items():
+                        if page_info.get('spaceId') == space_id and page_info.get('title') == page_title:
+                            # Found the page, use its actual title from XML
+                            logger.debug(f"Verified display link to space: '{space_key}', page: '{page_title}'")
+                            return f"{space_key}/{page_title}.md"
+            
+            # If we couldn't verify, still use the link but log a warning
+            logger.warning(f"Could not verify display link: space='{space_key}', page='{page_title}'")
+            return f"{space_key}/{page_title}.md"
+        elif len(parts) == 1:
+            space_key = parts[0]
+            # Verify this space exists in XML data
+            space_info = link_checker.attachment_processor.xml_processor.get_space_by_key(space_key)
+            if space_info:
+                logger.debug(f"Verified display link to space only: '{space_key}'")
+            else:
+                logger.warning(f"Could not verify space in display link: '{space_key}'")
+            return f"{space_key}.md"  # Default to space name
+
+    # Handle userLogoLink
+    if 'userLogoLink' in link or 'data-username' in link:
+        # Extract username from data-username attribute if available
+        username_match = re.search(r'data-username="([^"]+)"', link)
+        if username_match:
+            username = username_match.group(1).strip()
+            logger.debug(f"User link detected from data-username: '{username}'")
+            return f"@{username}"
+        else:
+            # Otherwise try to extract from href
+            username_match = re.search(r'/display/~([^\s"]+)', link)
+            if username_match:
+                username = username_match.group(1).strip()
+                logger.debug(f"User link detected from href: '{username}'")
+                return f"@{username}"
+            else:
+                logger.debug(f"Could not extract username from: '{link}'")
+                return ""
+
+    # Handle relative links with page ID (e.g., Title_18317659.html)
+    id_match = re.search(r'_(\d{6,10})\.html$', link)
+    if id_match:
+        page_id = id_match.group(1)
+        page_info = link_checker.attachment_processor.xml_processor.get_page_by_id(page_id)
+        if page_info:
+            page_title = page_info.get('title')
+            if page_info.get("spaceId"):
+                space_id = page_info.get("spaceId")
+                space_info = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+                if space_info and space_info.get("key"):
+                    target_space_key = space_info.get("key")
+                    logger.debug(f"Found page by ID: '{page_id}', title: '{page_title}', space '{target_space_key}'")
+                    return f"{target_space_key}/{page_title}.md"
+            logger.debug(f"Found page by ID: '{page_id}', title: '{page_title}'")
+            return f"{page_title}.md"
+
+    # Handle relative links with numeric page ID (e.g., 18317659.html)
+    id_match = re.search(r'(\d{6,10})\.html$', link)
+    if id_match:
+        page_id = id_match.group(1)
+        page_info = link_checker.attachment_processor.xml_processor.get_page_by_id(page_id)
+        if page_info:
+            page_title = page_info.get('title')
+            if page_info.get("spaceId"):
+                space_id = page_info.get("spaceId")
+                space_info = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+                if space_info and space_info.get("key"):
+                    target_space_key = space_info.get("key")
+                    logger.debug(f"Found page by ID: '{page_id}', title: '{page_title}', space '{target_space_key}'")
+                    return f"{target_space_key}/{page_title}.md"
+            logger.debug(f"Found page by ID: '{page_id}', title: '{page_title}'")
+            return f"{page_title}.md"
+
+    # If we get here and the link still has HTML extension, convert to MD
+    if link.endswith('.html'):
+        base_name = os.path.splitext(link)[0]
+        logger.debug(f"Converting HTML link to MD: '{link}'")
+        return f"{base_name}.md"
+
+    # If the link is a Confluence link to create a new space, remove it
+    if link.startswith(f"{config.CONFLUENCE_BASE_URL}?createDialogSpaceKey"):
+        logger.debug(f"Skipping createDialogSpaceKey link: '{link}'")
+        return ""
+
+    # If the link is a file from the mapping, replace by the new path
+    link_sanitized = link_checker.attachment_processor.xml_processor._sanitize_filename(link)
+    if link_sanitized:
+        for attachment_title, new_path in link_checker.attachment_processor.file_mapping.items():
+            if link_sanitized in attachment_title and (link_sanitized in os.path.basename(new_path)):
+                # create absolute path and replace backslashes by forward slashes
+                rel_path = os.path.relpath(new_path, link_checker.attachment_processor.config.OUTPUT_FOLDER).replace(os.sep, '/')
+                logger.debug(f"Found in attachment mapping: '{link}' -> '{rel_path}'")
+                return rel_path
+
+    # Default case - return the link as is
+    return link
+
+def _process_blog_posts(config: Config, link_checker: LinkChecker) -> None:
+    """
+    Process all blog posts from XML and convert them to Markdown.
+
+    Args:
+        config: The configuration object
+        stats: The statistics tracker
+    """
+    logger.info("Processing blog posts from XML...")
+
+    # Collect all blog post IDs
+    blog_post_ids = [
+        page_id for page_id, page in link_checker.attachment_processor.xml_processor.page.items()
+        if page.get("type") == "BlogPost"
+    ]
+
+    # Count total blog posts
+    total_blog_posts = len(blog_post_ids)
+
+    link_checker.attachment_processor.xml_processor.stats.total = total_blog_posts
+    
+    if total_blog_posts == 0:
+        logger.info("No blog posts found to process")
+        return
+    else:
+        logger.info(f"Found {total_blog_posts} blog posts to process")
+    
+    # Process each blog post
+    for blog_id in blog_post_ids:
+        blog_post = link_checker.attachment_processor.xml_processor.page[blog_id]
+        space_id = blog_post.get("spaceId")
+
+        # In case no spaceId is found
+        if not space_id:
+            logger.warning(f"Blog post {blog_id} has no space ID in page data")
+            # Try to find space ID through other means
+            space_id = link_checker.attachment_processor.xml_processor.find_space_id_for_blog(blog_id)
+            if not space_id:
+                logger.warning(f"Could not find space ID for blog post {blog_id}")
+                link_checker.attachment_processor.xml_processor.stats.skip_file("Blog Posts")
+                continue
+        
+        space_key = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+        if not space_key:
+            logger.warning(f"Could not find space info for ID {space_id} (blog {blog_id})")
+            link_checker.attachment_processor.xml_processor.stats.skip_file("Blog Posts")
+            continue
+        
+        space_key = space_key.get("key", "unknown")
+        if space_key == "unknown":
+            logger.warning(f"Could not determine space key for space ID {space_id} (blog {blog_id})")
+            link_checker.attachment_processor.xml_processor.stats.skip_file("Blog Posts")
+            continue
+
+        # Create the blog posts directory for this space
+        blog_dir = os.path.join(config.OUTPUT_FOLDER, space_key, config.BLOGPOST_PATH)
+        os.makedirs(blog_dir, exist_ok=True)
+
+        # Skip if no body content
+        if not blog_post.get("bodypage") or not blog_post["bodypage"].get("body"):
+            logger.warning(f"Blog post with ID {blog_id} has no body content")
+            link_checker.attachment_processor.xml_processor.stats.skip_file("Blog Posts")
+            continue
+
+        # Convert the blog post to Markdown
+        try:
+            md_path = _convert_blog_html_to_md(blog_post, blog_dir, config, link_checker)
+            link_checker.attachment_processor.xml_processor.stats.success += 1
+            logger.debug(f"Successfully converted blog post {blog_id} to {md_path}")
+        except Exception as e:
+            logger.error(f"Failed to convert blog post {blog_id}: {str(e)}", exc_info=True)
+            link_checker.attachment_processor.xml_processor.stats.failure += 1
+            continue
+
+        # Update progress
+        link_checker.attachment_processor.xml_processor.stats.processed += 1
+        link_checker.attachment_processor.xml_processor.stats.update_progress()
+
+    # Update phase stats
+    link_checker.attachment_processor.xml_processor.stats.update_phase_stats()
+    logger.info(f"Blog post processing complete. Processed {link_checker.attachment_processor.xml_processor.stats.success} of {total_blog_posts} blog posts.")
+
+def _convert_blog_html_to_md(blog_post: dict, output_dir: str, config: Config, link_checker: LinkChecker) -> str:
+    """
+    Convert a blog post's HTML body to Markdown and save it to a file.
+
+    Args:
+    blog_post: The blog post object with body content
+    output_dir: The directory to save the Markdown file
+    config: The configuration object
+
+    Returns:
+    The path to the created Markdown file
+    """
+    logger.info(f"Converting blog post {blog_post['id']} to Markdown")
+
+    # Extract HTML content from the blog post
+    html_content = blog_post["bodypage"]["body"]
+
+    # Remove CDATA wrapper if present
+    if html_content.startswith("<![CDATA[") and html_content.endswith("]]>"):
+        html_content = html_content[9:-3]
+
+    # Convert custom tags to HTML first
+    html_content = convert_custom_tags_to_html(html_content, logger)
+
+    # Convert HTML to Markdown
+    try:
+        logger.debug("Converting HTML to Markdown")
+        markdown_content = _convert_html_to_markdown(html_content)
+    except Exception as e:
+        logger.error(f"Failed to convert blog post {blog_post['id']}: {str(e)}")
+        raise Exception(f"Blog post conversion failed: {e}")
+
+    # Create filename from blog post title
+    filename = f"{blog_post['title']}.md"
+    output_path = os.path.join(output_dir, filename)
+
+    # Process attachment links in the blog post
+    page_id = blog_post['id']
+
+    logger.debug(f"Processing images, local attachments, and external links for blog post ID: {page_id}")    
+    markdown_content = link_checker.process_invalid_video_links(html_content, markdown_content)
+    markdown_content = link_checker.process_images(html_content, markdown_content)
+    markdown_content = link_checker.process_attachment_links(markdown_content)
+
+    # Add YAML header
+    if config.YAML_HEADER_BLOG:
+        # Combine YAML header and Markdown content
+        markdown_content = _insert_yaml_header_md_blogpost(markdown_content, blog_post, config, link_checker)
+
+    # Save the markdown file
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(markdown_content)
+
+    logger.info(f"Saved blog post to: {output_path}")
+    return output_path
+
+def _remove_link_list_on_top(markdown_content: str) -> str:
     """
     Removes any content that appears before the first heading in markdown content.
     Finds the first line starting with '#' and returns all content from that point forward.
@@ -1235,7 +1072,7 @@ def remove_header_link_list(markdown_content):
 
     return result
 
-def remove_space_details(markdown_content):
+def _remove_space_details(markdown_content: str) -> str:
     """
     Removes the "#  Space Details:" section from markdown content, stopping at the first H2 or next H1.
     Preserves all other sections, including "## Available Pages:" and other H1/H2 headers.
@@ -1246,6 +1083,7 @@ def remove_space_details(markdown_content):
     Returns:
         str: The cleaned markdown content with the Space Details section removed
     """
+    logger.debug("Removing space details header")
     space_header = config.SPACE_DETAILS_SECTION
 
     # Check if the Space Details header exists
@@ -1278,8 +1116,10 @@ def remove_space_details(markdown_content):
 
     return result
 
-def remove_confluence_footer(markdown_content: str) -> str:
+def _remove_confluence_footer(markdown_content: str) -> str:
     """Remove the standard Confluence footer from markdown content"""
+    logger.debug("Removing Confluence footer from markdown content")
+
     # Pattern to match the footer with variable date/time
     footer_pattern = r'\nDocument generated by Confluence on [A-Za-z]+\. \d{1,2}, \d{4} \d{1,2}:\d{2}\n\n\[Atlassian\]\(<https://www\.atlassian\.com/>\)\n*$'
     
@@ -1287,7 +1127,7 @@ def remove_confluence_footer(markdown_content: str) -> str:
     cleaned_content = re.sub(footer_pattern, '', markdown_content)
     return cleaned_content
 
-def remove_markdown_section(markdown_content: str, section_header: str) -> str:
+def _remove_markdown_section(markdown_content: str, section_header: str) -> str:
     """
     Remove a specific markdown section and all its content including subsections.
     Stops when it encounters another section at the same level or higher.
@@ -1301,9 +1141,9 @@ def remove_markdown_section(markdown_content: str, section_header: str) -> str:
         The markdown content with the specified section removed
 
     Example:
-        remove_markdown_section(content, "## Attachments:")
-        remove_markdown_section(content, "## Space contributors")
-        remove_markdown_section(content, "# Any other Header")
+        _remove_markdown_section(content, "## Attachments:")
+        _remove_markdown_section(content, "## Space contributors")
+        _remove_markdown_section(content, "# Any other Header")
     """
     logger.debug(f"Removing section '{section_header}' from markdown content")
 
@@ -1365,47 +1205,144 @@ def remove_markdown_section(markdown_content: str, section_header: str) -> str:
 
     return cleaned_content
 
-def extract_space_name(markdown_content: str) -> str:
+def _remove_markdown_lines(markdown_content: str, lines_to_remove: list[str]) -> str:
     """
-    Extract the 'Name' value from the Space Details table in the markdown content.
-    Returns None if not found.
+    Removes specific lines from the markdown content, handling potential surrounding whitespace
+    and ensuring correct newline handling. It removes all occurrences, including consecutive ones.
+
+    Args:
+        markdown_content: The original markdown content as a string.
+        lines_to_remove: A list of exact string lines to be removed (e.g., ["Merken"]).
+
+    Returns:
+        The markdown content with the specified lines removed.
     """
-    logger.debug("Extracting space name from markdown content")
+    if not lines_to_remove or not markdown_content:
+        # If there's nothing to remove, return the original content
+        return markdown_content
 
-    # Look for the Space Details header
-    if "#  Space Details:" not in markdown_content:
-        logger.debug("Space Details header not found")
-        return None
+    # Escape potential regex special characters in the lines to remove
+    # and strip whitespace from the config values for robust matching.
+    # Filter out any empty strings resulting from stripping.
+    patterns = [re.escape(line.strip()) for line in lines_to_remove if line.strip()]
 
-    # Split content to get the part after the header
-    parts = markdown_content.split("#  Space Details:", 1)
-    if len(parts) < 2:
-        return None
+    if not patterns:
+        # If lines_to_remove only contained whitespace or was empty after stripping
+        logger.debug("No valid non-whitespace patterns provided in lines_to_remove.")
+        return markdown_content
 
-    table_section = parts[1].strip().split("\n\n", 1)[0]
+    # Construct the regex pattern:
+    # ^                  - Anchor to the start of a line (due to re.MULTILINE flag).
+    # \s*                - Match optional leading whitespace on the line.
+    # (?:pattern1|...)   - Non-capturing group for all escaped patterns, joined by OR (|).
+    # \s*                - Match optional trailing whitespace on the line.
+    # (?:\r\n|\r|\n)?    - Match an optional universal newline sequence (\r\n, \r, or \n).
+    #                      The '?' makes it optional, correctly handling the last line of the file
+    #                      whether it has a trailing newline or not.
+    combined_pattern = r'^\s*(?:' + '|'.join(patterns) + r')\s*(?:\r\n|\r|\n)?'
 
-    # Try to match different table formats
+    # Store original length for comparison later
+    original_length = len(markdown_content)
 
-    # Format 1: | Key | Value |
-    pipe_pattern = re.compile(r'\|\s*Name\s*\|\s*([^|]+)\s*\|', re.MULTILINE)
-    match = pipe_pattern.search(table_section)
-    if match:
-        name = match.group(1).strip()
-        logger.debug(f"Found space name using pipe format: {name}")
-        return name
+    # Perform the substitution using re.sub.
+    # The re.MULTILINE flag ensures '^' matches the start of each line.
+    # We replace the entire matched pattern (line + optional newline) with an empty string.
+    try:
+        cleaned_content = re.sub(combined_pattern, '', markdown_content, flags=re.MULTILINE)
+    except re.error as e:
+        logger.error(f"Regex error during line removal: {e} with pattern: {combined_pattern}")
+        # Return original content if regex fails to prevent data loss
+        return markdown_content
 
-    # Format 2: Key | Value
-    alt_pattern = re.compile(r'Name\s*\|\s*(.+?)(?:\n|$)', re.MULTILINE)
-    match = alt_pattern.search(table_section)
-    if match:
-        name = match.group(1).strip()
-        logger.debug(f"Found space name: {name}")
-        return name
+    # Log if changes were made
+    if len(cleaned_content) < original_length:
+        # We can't easily count lines removed with regex without splitting again,
+        # so just log that *some* removal occurred based on the criteria.
+        logger.debug(f"Removed some lines matching criteria: {lines_to_remove}")
+    else:
+        logger.debug(f"No lines found matching criteria: {lines_to_remove}")
 
-    logger.debug("Space name not found in table")
-    return None
+    return cleaned_content
 
-def extract_space_metadata(markdown_content: str) -> tuple[str, str]:
+def _remove_embedded_icon_in_home_link(markdown_content: str) -> str:
+    """
+    Remove embedded icon in the home link in the h2 section.
+
+    Before: "* [[Startpage.md|Startpage]] ![](images/icons/contenttypes/home_page_16.png)"
+    After: "* [[Startpage.md|Startpage]]"
+
+    Args:
+        markdown_content: The markdown content to process
+
+    Returns:
+        The processed markdown content with embedded icons removed from home links
+    """
+    logger.debug("Removing embedded icons in home link")
+
+    lines = markdown_content.splitlines()
+    icon_link = ' ![](images/icons/contenttypes/home_page_16.png)'
+
+    # Find the h2 section index
+    h2_index = -1
+    for i, line in enumerate(lines):
+        if line.startswith('## '):
+            h2_index = i
+            logger.debug(f"Found h2 section at line {i}: {line}")
+            break
+
+    if h2_index == -1:
+        logger.debug("No h2 section found")
+        return markdown_content
+
+    # Check the line after h2 (or the line after that if the next line is empty)
+    target_index = h2_index + 1
+    if target_index < len(lines) and not lines[target_index].strip():
+        target_index += 1
+
+    # Check if we have a valid line to process
+    if target_index < len(lines):
+        target_line = lines[target_index]
+        logger.debug(f"Checking line {target_index}: {target_line}")
+
+        # Check if this line contains the icon
+        if icon_link in target_line:
+            logger.debug(f"Found icon to remove in line: {target_line}")
+            lines[target_index] = target_line.replace(icon_link, '')
+
+    return '\n'.join(lines)
+
+def _replace_first_header_name(markdown_content: str, new_filename: str) -> str:
+    """
+    Replace the first h1 section name with the filename.
+
+    Before: "#  Spacename : YourHeaderText "
+    After: "# YourHeaderText"
+
+    Args:
+        markdown_content: The markdown content to process
+        new_filename: The export path of the file
+
+    Returns:
+        The processed markdown content with the first h1 header replaced
+    """
+    logger.debug(f"Replacing header name with: {new_filename}")
+    # Extract the filename from the path
+    # Strip the path prefix (output\SOMETHING\) and the .md extension
+    filename = os.path.basename(new_filename)
+    if filename.endswith('.md'):
+        filename = filename[:-3]  # Remove .md extension
+
+    # Process line by line
+    lines = markdown_content.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith('# '):
+            # Replace with just the filename as header
+            lines[i] = f"# {filename}"
+            break  # Only process the first h1 header
+
+    return '\n'.join(lines)
+
+def _extract_space_metadata(markdown_content: str) -> tuple[str, str]:
     """
     Extract author, date information and space name from the Space Details table in markdown content.
     Returns a tuple of (author, date_created, space_name) or (None, None, None) if not found.
@@ -1466,7 +1403,7 @@ def extract_space_metadata(markdown_content: str) -> tuple[str, str]:
 
     return author, date_created, space_name
 
-def remove_created_by(markdown_content: str, return_line: bool = True) -> tuple[str, str]:
+def _remove_created_by(markdown_content: str, return_line: bool = True) -> tuple[str, str]:
     """
     Remove the 'Created by' line from markdown content and return both the cleaned content
     and the removed line.
@@ -1509,7 +1446,6 @@ def remove_created_by(markdown_content: str, return_line: bool = True) -> tuple[
             if i < len(lines) and lines[i].strip() == "":
                 lines.pop(i)
 
-            logger.debug("'Created by' line removed")
             break  # Exit loop after finding the first match
         i += 1
 
@@ -1518,235 +1454,204 @@ def remove_created_by(markdown_content: str, return_line: bool = True) -> tuple[
 
     return cleaned_content, created_by_line
 
-def insert_yaml_header_md(markdown_content: str, created_by_line: str, md_output: str, config: Config) -> str:
+def _insert_yaml_header_md(markdown_content: str, page_id: str, config: Config, link_checker: LinkChecker) -> str:
     """
     Insert a YAML header at the beginning of the markdown content with information
-    extracted from the 'Created by' line and file path.
+    extracted from XML data if available, or from the 'Created by' line and file path.
 
     Args:
         markdown_content: The original markdown content
-        created_by_line: The 'Created by' line that was removed from the content
-        md_output: The output file path
+        page_id: The ID of the page
         config: The configuration object containing YAML_HEADER template
+        link_checker: Used to get the right name for the up field
 
     Returns:
-        The markdown content with the YAML header added
-
-    Examples of created_by_line formats:
-    - 'Created by Unbekannter Benutzer (abc123), last modified on Feb. 01, 2017'
-    - 'Created by Unbekannter Benutzer (anyone), last modified by other user name on Jan. 30, 2025'
-    - 'Created by Unbekannter Benutzer (otherusername) on Apr 25, 2019'
+        The markdown content with the YAML header prepended
     """
-    logger.debug(f"Inserting YAML header into markdown content for {md_output}")
+    logger.debug(f"Inserting YAML header into markdown content for page ID: {page_id}")
 
     # Start with the template from config
     yaml_header = config.YAML_HEADER
 
     # Extract author from created_by_line
-    author = "unknown"
-    if created_by_line:
-        # Try to extract username from parentheses like "(abc123)"
-        author_match = re.search(r'\(([^)]+)\)', created_by_line)
-        if author_match:
-            author = author_match.group(1)
-            logger.debug(f"Extracted author: {author}")
-        else:
-            logger.debug(f"No author found in parentheses in: {created_by_line}")
+    default_author = "unknown"
+    default_date_created = "1999-12-31"  # Default date
+    author = default_author
+    date_created = default_date_created
+    parent_folder = config.DEFAULT_UP_FIELD
 
-    # Extract date from created_by_line
-    date_created = "1999-12-31"  # Default date
-    if created_by_line:
-        # Build a regex pattern that includes all month names from MONTH_PATTERNS
-        month_names = '|'.join(MONTH_PATTERNS.keys())
-        date_pattern = rf'({month_names})\.?\s+(\d{{1,2}}),?\s+(\d{{4}})'
-        
-        date_match = re.search(date_pattern, created_by_line)
-        if date_match:
-            logger.debug(f"DEBUG date_match: {date_match}")
-            month = MONTH_PATTERNS[date_match.group(1)]
-            day = date_match.group(2).zfill(2)  # Pad with leading zero if needed
-            year = date_match.group(3)
-            date_created = f"{year}-{month}-{day}"
-            logger.debug(f"Extracted date: {date_created}")
-        else:
-            logger.debug(f"No date found in: {created_by_line}")
+    # If we found a page ID, get its information
+    if page_id:
+        page_info = link_checker.attachment_processor.xml_processor.get_page_by_id(page_id)
 
-    # Get parent folder name for the up link
-    parent_folder = "Knowledge Base"  # Default value
-    dir_path = os.path.dirname(md_output)
-    if dir_path:
-        parent_folder = os.path.basename(dir_path)
-        if not parent_folder:  # If the directory is empty (root folder)
-            parent_folder = "Knowledge Base"
-        logger.debug(f"Extracted parent folder: {parent_folder}")
+        if page_info:
+            # Get creator name
+            if page_info.get("creatorId"):
+                author_id = page_info["creatorId"]
+                author_info = link_checker.attachment_processor.xml_processor.get_user_by_id(author_id)
+                author = author_info["name"]
+                logger.debug(f"Got author name: {author}")
+
+            # Get creation date
+            if page_info.get("creationDate"):
+                date_match = re.match(r'(\d{4})-(\d{2})-(\d{2})', page_info["creationDate"])
+                if date_match:
+                    year, month, day = date_match.groups()
+                    date_created = f"{year}-{month}-{day}"
+                    logger.debug(f"Got creation date from XML: {date_created}")
+
+            # Get parent title directly from the cached information
+            parent_title = link_checker.attachment_processor.xml_processor.get_parent_title_by_id(page_id)
+            if parent_title:
+                parent_folder = parent_title
+                logger.debug(f"Updated parent name to: {parent_folder}")
+    else:
+        logger.debug(f"Could not find page info: {parent_folder}")
 
     # Replace placeholders in the YAML header
-    yaml_header = yaml_header.replace('author: username', f'author: {author}')
-    yaml_header = re.sub(r'dateCreated:\s*\d{4}-\d{2}-\d{2}', f'dateCreated: {date_created}', yaml_header)
-    yaml_header = yaml_header.replace('"[[Knowledge Base]]"', f'"[[{parent_folder}]]"')
+    yaml_header = yaml_header.replace('author: [username]', f'author: {author}')
+    yaml_header = yaml_header.replace('dateCreated: [date_created]', f'dateCreated: {date_created}')
+    yaml_header = yaml_header.replace('[[up_field]]', f'[[{parent_folder}]]')
 
     # Add the YAML header to the markdown content
     updated_content = yaml_header + '\n\n' + markdown_content
 
     return updated_content
 
-def insert_yaml_header_md_index(markdown_content: str, md_output: str, config: Config) -> str:
+def _insert_yaml_header_md_index(markdown_content: str, page_id: str, config: Config, link_checker: LinkChecker) -> str:
     """
     Insert a YAML header at the beginning of index markdown files with information
     extracted from the Space Details table and file path.
 
     Args:
         markdown_content: The original markdown content
-        md_output: The output file path
+        page_id: The ID of the page to which the YAML header will be added
         config: The configuration object containing YAML_HEADER template
+        link_checker: Used to get the right name for the up field
 
     Returns:
         The markdown content with the YAML header added
     """
-    logger.debug(f"Inserting YAML header into index markdown content for {md_output}")
+    logger.debug(f"Inserting YAML header into index markdown content for page ID: {page_id}")
 
     # Start with the template from config
     yaml_header = config.YAML_HEADER
 
-    # Extract author, date and name from the Space Details table
-    author, date_created, _ = extract_space_metadata(markdown_content)
+    # Default values
+    default_author = "unknown"
+    default_date_created = "1999-12-31"  # Default date
+    author = default_author
+    date_created = default_date_created
+    parent_folder = "" # should be empty, as it's the highest level (alt: config.DEFAULT_UP_FIELD)
 
-    if not author:
-        author = "unknown"
-        logger.debug(f"No author found in Space Details, using default: {author}")
+    # Try to get information from XML if available
+    if link_checker.attachment_processor.xml_processor is not None:
+        logger.debug(f"Using XML Checker to get Header info")
 
-    if not date_created:
-        date_created = "1999-12-31"  # Default date
-        logger.debug(f"No date found in Space Details, using default: {date_created}")
+        # If we found a page ID, get its information
+        if page_id:
+            space_id = link_checker.attachment_processor.xml_processor.get_space_id_by_page_id(page_id)
+            logger.debug(f"Retrieved space ID: {space_id}")
+            if space_id:
+                space_info = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+                logger.debug("Retrieved space info by space ID")
+            if not space_info:
+                space_info = link_checker.attachment_processor.xml_processor.get_page_by_id(page_id)
+                logger.debug("Fallback to page info")
+            if not space_info:
+                logger.debug(f"No space or page info found for page ID: {page_id}")
+            if space_info:
+                # Get creator
+                if space_info.get("creatorId"):
+                    author_id = space_info["creatorId"]
+                    author_info = link_checker.attachment_processor.xml_processor.get_user_by_id(author_id)
+                    author = author_info["name"]
+                    logger.debug(f"Got author name: {author}")
 
-    # Get parent folder name for the up link
-    parent_folder = "Knowledge Base"  # Default value
-    dir_path = os.path.dirname(md_output)
-    if dir_path:
-        parent_folder = os.path.basename(dir_path)
-        if not parent_folder:  # If the directory is empty (root folder)
-            parent_folder = "Knowledge Base"
-        logger.debug(f"Extracted parent folder: {parent_folder}")
+                # Get creation date
+                if space_info.get("creationDate"):
+                    date_match = re.match(r'(\d{4})-(\d{2})-(\d{2})', space_info["creationDate"])
+                    if date_match:
+                        year, month, day = date_match.groups()
+                        date_created = f"{year}-{month}-{day}"
+                        logger.debug(f"Got creation date from XML: {date_created}")
 
+            else:
+                logger.debug(f"Could not find page info for page ID: {page_id}")
+
+    # Fall back to extracting from Space Details table if XML data wasn't available
+    if author == default_author or date_created == default_date_created:
+        extracted_author, extracted_date, _ = _extract_space_metadata(markdown_content)
+
+        if extracted_author and author == default_author:
+            author = extracted_author
+            logger.debug(f"Extracted author from Space Details: {author}")
+        elif not extracted_author and author == default_author:
+            logger.debug(f"Could not extract author from Space Details for ID: {page_id}. Using default: {default_author}")
+
+        if extracted_date and date_created == default_date_created:
+            date_created = extracted_date
+            logger.debug(f"Extracted date from Space Details: {date_created}")
+        elif not extracted_date and date_created == default_date_created:
+            logger.debug(f"Could not extract date from Space Details for ID: {page_id}. Using default: {default_date_created}")
+    
     # Replace placeholders in the YAML header
-    yaml_header = yaml_header.replace('author: username', f'author: {author}')
-    yaml_header = re.sub(r'dateCreated:\s*\d{4}-\d{2}-\d{2}', f'dateCreated: {date_created}', yaml_header)
-    yaml_header = yaml_header.replace('"[[Knowledge Base]]"', f'"[[{parent_folder}]]"')
+    yaml_header = yaml_header.replace('author: [username]', f'author: {author}')
+    yaml_header = yaml_header.replace('dateCreated: [date_created]', f'dateCreated: {date_created}')
+    yaml_header = yaml_header.replace('[[up_field]]', f'[[{parent_folder}]]')
 
     # Add the YAML header to the markdown content
     updated_content = yaml_header + '\n\n' + markdown_content
 
     return updated_content
 
-def main(config: Config, logger: logging.Logger) -> None:
-    try:
-        logger.debug("=== Starting HTML to Markdown Conversion Process ===")
-        logger.debug(f"Python version: {sys.version}")
+def _insert_yaml_header_md_blogpost(markdown_content: str, blog_post: str, config: Config, link_checker: LinkChecker) -> str:
+    """
+    Insert a YAML header at the beginning of blog post markdown content with information
+    extracted from XML data or other metadata.
+    Args:
+        markdown_content: The original markdown content
+        page_id: The ID of the page to retrieve metadata for
+        config: The configuration object containing YAML_HEADER template
+    """
+    # Get author name
+    author = "unknown"
+    if blog_post.get("creatorId"):
+        author_info = link_checker.attachment_processor.xml_processor.get_user_by_id(blog_post["creatorId"])
+        if author_info:
+            author = author_info["name"]
 
-        # Get list of input folders
-        input_folders = []
-        if os.path.isdir(config.INPUT_FOLDER):
-            # If INPUT_FOLDER is a directory, use it directly
-            input_folders = [config.INPUT_FOLDER]
-        else:
-            # If INPUT_FOLDER is a pattern or list, expand it
-            input_folders = [folder for folder in config.INPUT_FOLDER.split(',') if os.path.isdir(folder)]
+    # Get creation date
+    date_created = "1900-12-31"
+    if blog_post.get("creationDate"):
+        date_match = re.match(r'(\d{4})-(\d{2})-(\d{2})', blog_post["creationDate"])
+        if date_match:
+            year, month, day = date_match.groups()
+            date_created = f"{year}-{month}-{day}"
 
-        logger.debug(f"Input folders: {input_folders}")
-        logger.debug(f"Output folder: {os.path.abspath(config.OUTPUT_FOLDER)}")
+    # Get space name as parent folder
+    space_id = link_checker.attachment_processor.xml_processor.get_space_id_by_page_id(blog_post['id'])
+    space_info = link_checker.attachment_processor.xml_processor.get_space_by_id(space_id)
+    parent_id = space_info.get('homePageId', '')
+    parent_folder = link_checker.attachment_processor.xml_processor.get_page_title_by_id(parent_id)
+    logger.debug(f"Space ID: {space_id}, Parent ID: {parent_id}, Parent Folder: {parent_folder}")
+    if parent_folder == None:
+        parent_folder = ""
+    logger.debug(f"Parent folder determined as: {parent_folder}")
+    
+    # Create YAML header
+    yaml_header = config.YAML_HEADER_BLOG
+    yaml_header = yaml_header.replace('author: [username]', f'author: {author}')
+    yaml_header = yaml_header.replace('dateCreated: [date_created]', f'dateCreated: {date_created}')
+    yaml_header = yaml_header.replace('[[up_field]]', f'[[{parent_folder}]]')
 
-        # Create output folder
-        os.makedirs(config.OUTPUT_FOLDER, exist_ok=True)
-        logger.debug(f"Output directory structure created: {config.OUTPUT_FOLDER}")
+    # Combine YAML header and Markdown content
+    markdown_content = yaml_header + "\n\n" + markdown_content
 
-        # Initialize statistics
-        stats = ConversionStats()
+    # return results
+    return markdown_content
 
-        # Initialize link checker
-        link_checker = LinkChecker(config)
-        link_checker._build_file_cache()
-
-        # Count total HTML files across all input folders
-        print_status("Scanning files...")
-        total_html_count = count_html_files(input_folders, config)
-
-        logger.debug(f"Found {total_html_count} HTML files to process across all input folders")
-        print_status(f"Found {total_html_count} HTML files to process")
-
-        # First pass: Handle special folders for all input folders
-        print_status("Copying special folders (attachments and images)...")        
-        for input_folder in input_folders:
-            for root, _, files in os.walk(input_folder):
-                # Get relative path
-                rel_path = os.path.relpath(root, input_folder)
-                output_dir = os.path.join(config.OUTPUT_FOLDER, rel_path)
-
-                # Check if this is a special folder
-                folder_type = get_special_folder_type(root, config)
-
-                # Ignoring 'styles' folder on purpose
-                if folder_type:
-                    # Handle special folders based on type
-                    if folder_type in ["attachments", "images"]:
-                        # Create output directory for attachments and images
-                        os.makedirs(output_dir, exist_ok=True)
-                        # Copy special folders
-                        handle_special_folders(root, output_dir)
-                    if folder_type in ["styles"]:
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            logger.info(f"SKIPPED: File in styles folder: {file_path}")
-
-        # Second pass: Convert HTML files to Markdown for all input folders
-        print_status("Converting HTML files to Markdown...")
-        stats.set_phase("Converting")  # Start conversion phase
-        stats.total = total_html_count
-
-        for input_folder in input_folders:
-            for root, _, files in os.walk(input_folder):
-                # Skip special folders
-                if get_special_folder_type(root, config):
-                    continue
-
-                rel_path = os.path.relpath(root, input_folder)
-                output_dir = os.path.join(config.OUTPUT_FOLDER, rel_path)
-                os.makedirs(output_dir, exist_ok=True)
-
-                # Process HTML files (convert only)
-                process_html_files(root, files, output_dir, stats, config, link_checker)
-
-        # Third pass: Fix all crosslinks using the complete mapping
-        print_status("\nFixing crosslinks in all Markdown files...")
-        stats.update_phase_stats()  # Save converting stats
-        stats.set_phase("Fixing links")  # Start conversion phase
-
-        # Fix md crosslinks
-        fix_md_crosslinks(config.OUTPUT_FOLDER, link_checker, stats)
-
-        # Update phase stats after fixing links
-        stats.update_phase_stats()
-
-        # Debug print mappings
-        if config.LOG_LINK_MAPPING == True:
-            debug_print_mappings(link_checker)
-
-        # Log summary of skipped files
-        if stats.phase_stats["Converting"]["skipped"] > 0:
-            logger.info(f"=== Summary: {stats.phase_stats['Converting']['skipped']} Files were skipped ===")
-
-        print("\n")
-        print_status("Finalizing and cleaning up...")
-        logger.info("To find all skipped files, search the log for 'SKIPPED:'")
-        logger.debug("=== Conversion Process Complete ===")
-        print("\n")
-        stats.print_final_report()
-
-    except Exception as e:
-        logger.error("Process failed", exc_info=True)
-        print_status(str(e), error=True)
-        sys.exit(1)
-
-def debug_print_mappings(link_checker: LinkChecker):
+def _debug_print_mappings(link_checker: LinkChecker) -> None:
     """Print all filename mappings for debugging"""
     logger.debug("=== Filename Mappings ===")
     for old_path, new_path in link_checker.filename_mapping.items():
@@ -1759,12 +1664,170 @@ def debug_print_mappings(link_checker: LinkChecker):
 
     logger.debug("=== End of Mappings ===")
 
+def main(config: Config, logger: logging.Logger) -> None:
+    try:
+        logger.info("=== Starting HTML to Markdown Conversion Process ===")
+        logger.debug(f"Python version: {sys.version}")
+
+        # Get list of input folders
+        input_folders = []
+        if os.path.isdir(config.INPUT_FOLDER):
+            # If INPUT_FOLDER is a directory, use it directly
+            input_folders = [config.INPUT_FOLDER]
+        else:
+            # If INPUT_FOLDER is a pattern or list, expand it
+            input_folders = [folder for folder in config.INPUT_FOLDER.split(',') if os.path.isdir(folder)]
+
+        logger.info(f"Input folders: {input_folders}")
+        logger.info(f"Output folder: {os.path.abspath(config.OUTPUT_FOLDER)}")
+
+        # Create output folder
+        os.makedirs(config.OUTPUT_FOLDER, exist_ok=True)
+        logger.debug(f"Output directory structure created: {config.OUTPUT_FOLDER}")
+        
+        # Initialize statistics
+        stats = ConversionStats()
+
+        # Initialize both tools with the same reference
+        xml_processor = XmlProcessor(config, logger, stats=stats)
+        attachment_processor = AttachmentProcessor(config, logger, xml_processor)
+        link_checker = LinkChecker(config, logger, attachment_processor)
+
+        # Count total HTML files across all input folders
+        print_status("Scanning Attachments...")
+        total_html_count = _count_html_files(input_folders, config)
+
+        logger.debug(f"Found {total_html_count} HTML files to process across all input folders")
+        print_status(f"Found {total_html_count} HTML files to process...")
+
+        # Process all XML files to build a complete cache
+        print_status("Processing XML files...")
+        
+        # Set the phase to XML Processing before processing XML files
+        link_checker.attachment_processor.xml_processor.stats.set_phase("XML Processing")
+        
+        # Count XML files first
+        xml_files_to_process = []
+        for input_folder in input_folders:
+            _, subfolders, _ = next(os.walk(input_folder))
+            for subfolder in subfolders:
+                # Skip special folders
+                if _get_special_folder_type(subfolder, config) is not None:
+                    continue
+                
+                exists, xml_path = xml_processor.verify_xml_file(subfolder, config, logger=logger)
+                if exists:
+                    xml_files_to_process.append(xml_path)
+        
+        # Set total XML files to process
+        link_checker.attachment_processor.xml_processor.stats.total = len(xml_files_to_process)
+        logger.info(f"Found {link_checker.attachment_processor.xml_processor.stats.total} XML files to process")
+        
+        # Process each XML file
+        for xml_path in xml_files_to_process:
+            success = link_checker.attachment_processor.xml_processor.add_xml_file(xml_path)
+            link_checker.attachment_processor.xml_processor.stats.processed += 1
+            if success:
+                link_checker.attachment_processor.xml_processor.stats.success += 1
+            else:
+                link_checker.attachment_processor.xml_processor.stats.failure += 1
+            link_checker.attachment_processor.xml_processor.stats.update_progress()
+        
+        # Update phase stats after XML processing
+        link_checker.attachment_processor.xml_processor.stats.update_phase_stats()
+
+        # Create a mapping for attachments
+        print("")  # add newline to prevent cluttering
+        print_status("Mapping Attachments...")
+        for input_folder in input_folders:
+            _, subfolders, _ = next(os.walk(input_folder))
+            for subfolder in subfolders:
+                # Skip special folders
+                if _get_special_folder_type(subfolder, config) == config.STYLES_PATH:
+                    logger.debug(f"Skipping folder: {subfolder}")
+                    continue
+
+                # Verify XML file exists for this space
+                exists, xml_path = link_checker.attachment_processor.xml_processor.verify_xml_file(subfolder, config, logger)
+
+                if exists:
+                    # Process attachments
+                    logger.info(f"Building attachment mapping from XML: {xml_path}")
+                    # Get the space directory name from subfolder
+                    space_dir = os.path.basename(subfolder)
+                    link_checker.attachment_processor.process_xml_attachments(xml_path)
+                    link_checker.attachment_processor.process_space_attachments(space_dir)
+                    link_checker.attachment_processor.generate_mapping_file()
+                    link_checker.attachment_processor.copy_images_folder(subfolder, config, logger)
+
+                else:
+                    logger.warning(f"No XML file found for space: {subfolder}. Skipping attachment processing.")
+
+        # Log the total number of pages found
+        logger.info(f"Total pages found across all XML files: {len(link_checker.attachment_processor.xml_processor.page)}")
+
+        # Third pass: Convert HTML files to Markdown for all input folders
+        print_status("Converting HTML files to Markdown...")
+        link_checker.attachment_processor.xml_processor.stats.set_phase("Converting")  # Start conversion phase
+        link_checker.attachment_processor.xml_processor.stats.total = total_html_count
+
+        for input_folder in input_folders:
+            for root, _, files in os.walk(input_folder):
+                # Skip special folders
+                if _get_special_folder_type(root, config) is not None:
+                    continue
+
+                rel_path = os.path.relpath(root, input_folder)
+                output_dir = os.path.join(config.OUTPUT_FOLDER, rel_path)
+                os.makedirs(output_dir, exist_ok=True)
+
+                # Process HTML files (convert only)
+                _process_html_files(root, files, output_dir, config, link_checker)
+
+        # Update phase stats after converting
+        link_checker.attachment_processor.xml_processor.stats.update_phase_stats()
+
+        # Fourth pass: Process blog posts
+        print("") # add newline to prevent cluttering
+        print_status("Processing blog posts...")
+        link_checker.attachment_processor.xml_processor.stats.set_phase("Blog Posts")
+        _process_blog_posts(config, link_checker)
+        # Update phase stats after blog posts
+        link_checker.attachment_processor.xml_processor.stats.update_phase_stats()
+
+        # Fifth pass: Fix all crosslinks using the complete mapping
+        print("") # add newline to prevent cluttering
+        print_status("Fixing crosslinks in all Markdown files...")
+        link_checker.attachment_processor.xml_processor.stats.set_phase("Fixing links")  # Start conversion phase
+        _fix_md_crosslinks(config.OUTPUT_FOLDER, link_checker)
+        # Update phase stats after fixing links
+        link_checker.attachment_processor.xml_processor.stats.update_phase_stats()
+
+        # Debug print mappings
+        if config.LOG_LINK_MAPPING == True:
+            _debug_print_mappings(link_checker)
+
+        # Log summary of skipped files
+        if link_checker.attachment_processor.xml_processor.stats.phase_stats["Converting"]["skipped"] > 0:
+            logger.info(f"=== Summary: {link_checker.attachment_processor.xml_processor.stats.phase_stats['Converting']['skipped']} Files were skipped ===")
+
+        #print("\n")
+        print_status("Finalizing and cleaning up...")
+        logger.info("=== Conversion Process Complete ===")
+        print("\n")
+
+        # Print and log the final report
+        final_report = link_checker.attachment_processor.xml_processor.stats.print_final_report()
+        logger.info(final_report)
+
+    except Exception as e:
+        logger.error("Process failed", exc_info=True)
+        print_status(str(e), error=True)
+        sys.exit(1)
+
 if __name__ == "__main__":
     # Parse command line arguments
     args = parse_args()
-
-    # Load configuration from config.py (which will load from config.ps1)
-    from config import load_config
 
     # Merge command line arguments with config from file
     config = load_config(args)

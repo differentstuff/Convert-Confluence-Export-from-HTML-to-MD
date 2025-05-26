@@ -6,45 +6,64 @@ from typing import List, Dict, Any
 
 @dataclass
 class Config:
+    # Do not change the default settings unless you understand what they do.
+    # User settings should be defined in config.ps1
     CONFLUENCE_BASE_URL: str = "https://confluence.myCompany.com"
-    INPUT_FOLDER: str = "in"
-    OUTPUT_FOLDER: str = "out"
+    INPUT_FOLDER: str = "input"
+    INPUT_FOLDER_XML: str = "input-xml"
+    OUTPUT_FOLDER: str = "output"
+    XML_FILE: str = "entities.xml"
     ATTACHMENTS_PATH: str = "attachments"
     IMAGES_PATH: str = "images"
     STYLES_PATH: str = "styles"
+    BLOGPOST_PATH: str = "blogposts"
     LOG_FOLDER_NAME: str = "logs"
-    LOG_PATH_NAME: str = "html2mdConverter"
+    DEFAULT_UP_FIELD: str = ""
     YAML_HEADER: str = ""
+    YAML_HEADER_BLOG: str = ""
     SPACE_DETAILS_SECTION: str = ""
     INVALID_VIDEO_INDICATOR: str = "Your browser does not support the HTML5 video element"
+    FILESERVER_INDICATOR: str = "from config"
+    FILESERVER_REPLACEMENT_ENABLED: bool = False
+    BLOGPOST_LINK_INDICATOR: str = "Edit"
+    BLOGPOST_LINK_REPLACEMENT: str = " (Blogpost)"
+    BLOGPOST_LINK_REPLACEMENT_ENABLED: bool = True
     RENAME_ALL_FILES: bool = False
     LOG_LINK_MAPPING: bool = False
     USE_UNDERSCORE_IN_FILENAMES: bool = False
     INSERT_YAML_HEADER: bool = False
     USE_WIKI_LINKS: bool = True
     USE_ESCAPING_FOR_WIKI_LINKS: bool = True
+    UNDERSCORE_HOMEPAGE_TITLES: bool = True
+    REMOVE_ALL_TAGS_FROM_INDEX: bool = True
     SECTIONS_TO_REMOVE: List[str] = field(default_factory=list)
+    LINES_TO_REMOVE: List[str] = field(default_factory=list)
     THUMBNAILS_TO_REMOVE: List[str] = field(default_factory=list)
     THUMBNAIL_PATH: List[str] = field(default_factory=list)
     PREFIXES: List[str] = field(default_factory=list)
     PREFIXES_TO_REMOVE: List[str] = field(default_factory=list)
 
-    # Derived properties
+    # Logging properties
+    LOG_PATH_NAME: str = "html2mdConverter"
     LOG_FOLDER: str = None
     LOG_FILE_NAME: str = None
     LOG_FILE: str = None
+    LOG_LEVEL_FILES: str = 'DEBUG'  # Level for logging file
+    LOG_LEVEL_CONSOLE: str = 'ERROR'  # Level for console output
+    LOG_LEVEL_GENERAL: str = 'DEBUG'  # Level for all else
 
     def __post_init__(self):
+        # Get parent directory of OUTPUT_FOLDER
+        output_parent_dir = os.path.dirname(self.OUTPUT_FOLDER)
+        
         # Set derived properties
-        self.LOG_FOLDER = os.path.join(self.OUTPUT_FOLDER, self.LOG_FOLDER_NAME)
+        self.LOG_FOLDER = os.path.join(output_parent_dir, self.LOG_FOLDER_NAME)
         self.LOG_FILE_NAME = f"{self.LOG_PATH_NAME}.log"
         self.LOG_FILE = os.path.join(self.LOG_FOLDER, self.LOG_FILE_NAME)
 
         # Set default lists if they're None
         if not self.SECTIONS_TO_REMOVE:
             self.SECTIONS_TO_REMOVE = [
-                "# Zusatzinformation auf TC-Filesystem",
-                "## Verwandte Artikel",
                 "## Attachments",
                 "## Space contributors",
                 "## Recent space activity"
@@ -82,7 +101,7 @@ class Config:
         # Create necessary directories
         os.makedirs(self.LOG_FOLDER, exist_ok=True)
 
-def load_config_from_powershell() -> Dict[str, Any]:
+def _load_config_from_powershell() -> Dict[str, Any]:
     """Load configuration from config.ps1 using PowerShell"""
     try:
         # Run PowerShell to export config to JSON
@@ -112,7 +131,7 @@ def load_config(args) -> Config:
 
     # Try to load from PowerShell
     try:
-        ps_config = load_config_from_powershell()
+        ps_config = _load_config_from_powershell()
 
         # Update config from PowerShell values
         if ps_config:

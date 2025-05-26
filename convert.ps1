@@ -21,7 +21,6 @@ if (-not (Test-Path $($Config.OutputFolder))) {
 }
 else{
     Write-Host "Directory already exists: $($Config.OutputFolder)" -ForegroundColor Green
-    Write-Host
 
     $hasContent = Get-ChildItem $($Config.OutputFolder) | Where-Object {$_.Name -ne "logs"}
     if($hasContent.Length -gt 0){
@@ -29,7 +28,7 @@ else{
         Write-Host "> Are you sure you want to continue?" -ForegroundColor Red
         Write-Host "(0) Abort [default]" -ForegroundColor Gray
         Write-Host "(1) Ignore and continue" -ForegroundColor Gray
-        Write-Host "(2) Clean folder and continue [Deletes all content! Use with caution]" -ForegroundColor Gray
+        Write-Host "(2) Clean folder and continue [Deletes content in 'output' folder! Use with caution]" -ForegroundColor Gray
         $userResponse = Read-Host -Prompt "Please choose an Option"
 
         switch($userResponse){
@@ -71,9 +70,28 @@ else{
                 $userConfirmation2 = Read-Host -Prompt "[Y/1] or [N/2]"
                 # delete
                 if(($userConfirmation2.ToLower() -eq "y") -or ($userConfirmation2.ToLower() -eq "1")){
-                    # Remove the directory and its contents
+                    # Remove output directory and its contents
                     Remove-Item -Path $($Config.OutputFolder) -Recurse -Force -ErrorAction SilentlyContinue | Out-Null
+                    
+                    # Rename log files
+                    $logItems = Get-ChildItem $($Config.LogFolder) | Where-Object {$_.Name -eq "$($Config.LogPathName).log"}
+                    foreach ($item in $logItems) {
+                        # Format date as YYYYMMDD_HHMMSS
+                        $timestamp = $item.LastWriteTime.ToString("yyyyMMdd_HHmmss")
+    
+                        # Build new filename (preserve extension)
+                        $newName = "{0}_{1}{2}" -f $item.BaseName, $timestamp, $item.Extension
+    
+                        # Full path for destination
+                        $destination = Join-Path $item.Directory.FullName $newName
+    
+                        Write-Host ""
+                        Write-Host "Existing Log file has been renamed to: $newName" -ForegroundColor Yellow
 
+                        # Move/rename the file
+                        Move-Item $item.FullName -Destination $destination
+                    }
+                    
                     # Verify the directory is gone
                     if (Test-Path $($Config.OutputFolder)) {
                         # If it still exists, try more aggressive removal
@@ -148,7 +166,7 @@ catch{
     exit 1
 }
 
-# Step 3: Activate virtual environment and run Python conversion
+# Step 3: Run Python conversion
 try {    
     Show-StepHeader "3" "Converting HTML to Markdown"
     Write-Host "Starting conversion process..." -ForegroundColor Yellow
@@ -156,6 +174,7 @@ try {
     $pythonArgs = @(
         $PYTHONSCRIPT,
         "--input", $Config.InputFolder,
+		"--input-xml", $Config.InputFolderXml,
         "--output", $Config.OutputFolder,
         "--base-url", $Config.ConfluenceBaseUrl
     )
@@ -185,6 +204,7 @@ catch {
     Write-Host "`nPress Enter to quit..." -ForegroundColor Yellow
     $null = Read-Host
 }
+
 # Step 4: Complete and Cleanup
 finally {
     Show-StepHeader "4" "Completion"
