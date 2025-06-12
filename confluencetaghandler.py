@@ -46,7 +46,7 @@ class ConfluenceTagHandler:
 
 class ImageHandler(ConfluenceTagHandler):
     """Handler for <ac:image> tags, converting them to standard <img> tags."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -125,7 +125,7 @@ class ImageHandler(ConfluenceTagHandler):
 
 class LinkHandler(ConfluenceTagHandler):
     """Handler for <ac:link> tags, converting them to standard <a> tags."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -138,27 +138,28 @@ class LinkHandler(ConfluenceTagHandler):
         try:
             href = None
             text = ""
-            link_body = tag.find('ac:plain-text-link-body') or tag.find('ac:link-body')
-            if link_body:
-                text = link_body.get_text()
+
+            link_body = tag.find('ac:plain-text-link-body') or tag.find('ac:link-body')            
             page = tag.find('ri:page')
             attachment = tag.find('ri:attachment')
             url = tag.find('ri:url')
-            blog_post = tag.find('ri:blog-post')
             shortcut = tag.find('ri:shortcut')
             anchor = tag.get('ac:anchor')
+            user = tag.find('ri:user')
 
-            if url and url.has_attr('ri:value'):
+            if user and user.has_attr('ri:userkey'):
+                userkey = user['ri:userkey']
+                href = f"/userkey/{userkey}"
+                text = userkey  # Use the userkey as the text content
+            elif url and url.has_attr('ri:value'):
                 href = url['ri:value']
             elif page and page.has_attr('ri:content-title'):
                 space = page.get('ri:space-key', '')
                 title = page['ri:content-title']
-                href = f"/spaces/{space}/pages/{title.replace(' ', '_')}" if space else f"/pages/{title.replace(' ', '_')}"
+                href = f"/spaces/{space}/pages/{title}" if space else f"/pages/{title}"
             elif attachment and attachment.has_attr('ri:filename'):
                 href = attachment['ri:filename']
                 self.logger.debug(f"Found attachment link: {href}")
-            elif blog_post and blog_post.has_attr('ri:content-title'):
-                href = f"/blog/{blog_post['ri:content-title'].replace(' ', '_')}"
             elif shortcut and shortcut.has_attr('ri:key'):
                 key = shortcut['ri:key']
                 param = shortcut.get('ri:parameter', '')
@@ -166,10 +167,13 @@ class LinkHandler(ConfluenceTagHandler):
             elif anchor:
                 href = f"#{anchor}"
 
-            if not text:
-                text = href or "link"
+            if link_body and not text:
+                text = link_body.get_text()
 
-            a_tag = self.create_replacement('a', href=href or "#")
+            if not text:
+                text = href or "broken_link"
+
+            a_tag = self.create_replacement('a', href=href)
             a_tag.string = text
             tag.replace_with(a_tag)
         except Exception as e:
@@ -178,7 +182,7 @@ class LinkHandler(ConfluenceTagHandler):
 
 class StructuredMacroHandler(ConfluenceTagHandler):
     """Handler for <ac:structured-macro> tags, converting them to appropriate HTML structures."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -225,7 +229,7 @@ class StructuredMacroHandler(ConfluenceTagHandler):
                 div.string = f"[{macro_name} content placeholder]"
                 tag.replace_with(div)
             else:
-                self.logger.info(f"Unhandled macro: {macro_name}")
+                self.logger.debug(f"Unhandled macro: {macro_name}")
                 tag.unwrap()
         except Exception as e:
             self.logger.error(f"Error handling structured macro {tag}: {e}")
@@ -233,7 +237,7 @@ class StructuredMacroHandler(ConfluenceTagHandler):
 
 class TaskListHandler(ConfluenceTagHandler):
     """Handler for <ac:task-list> tags, converting them to <ul> with checkbox indicators."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -259,7 +263,7 @@ class TaskListHandler(ConfluenceTagHandler):
 
 class LayoutHandler(ConfluenceTagHandler):
     """Handler for <ac:layout> tags, converting them to structured <div> elements."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -285,7 +289,7 @@ class LayoutHandler(ConfluenceTagHandler):
 
 class EmoticonHandler(ConfluenceTagHandler):
     """Handler for <ac:emoticon> tags, converting them to <span> elements."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -306,7 +310,7 @@ class EmoticonHandler(ConfluenceTagHandler):
 
 class PlaceholderHandler(ConfluenceTagHandler):
     """Handler for <ac:placeholder> tags, converting them to <span> elements."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -326,7 +330,7 @@ class PlaceholderHandler(ConfluenceTagHandler):
 
 class StatusHandler(ConfluenceTagHandler):
     """Handler for <ac:status> tags, converting them to styled <span> elements."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -348,7 +352,7 @@ class StatusHandler(ConfluenceTagHandler):
 
 class TextBodyHandler(ConfluenceTagHandler):
     """Handler for <ac:rich-text-body> and <ac:plain-text-body> tags, unwrapping them."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -366,7 +370,7 @@ class TextBodyHandler(ConfluenceTagHandler):
 
 class AttachmentHandler(ConfluenceTagHandler):
     """Handler for <ri:attachment> tags when they appear outside of other tags."""
-    def __init__(self, soup: BeautifulSoup, logger: logging.Logger): # Add logger parameter
+    def __init__(self, soup: BeautifulSoup, logger: logging.Logger):
         super().__init__(soup, logger) # Pass logger to super
 
     def handle(self, tag: Tag) -> None:
@@ -409,34 +413,14 @@ def convert_custom_tags_to_html(content: str, logger: logging.Logger) -> str:
         return ""
 
     try:
-        logger.debug(f"Original content for custom tag conversion (first 100 chars): {content[:100]}")
-
         # Decode HTML entities to ensure proper processing
         decoded_content = html.unescape(content)
-        logger.debug(f"Decoded content (first 100 chars): {decoded_content[:100]}")
 
-        # Ensure the content is wrapped in a root element for proper XML parsing
-        # Only do this if it doesn't already have a root element
-        #if not (decoded_content.strip().startswith('<') and decoded_content.strip().endswith('>')):
-        #    wrapped_content = f"<div>{decoded_content}</div>"
-        #else:
-        #    wrapped_content = decoded_content
-        wrapped_content = decoded_content
-        #logger.debug(f"Wrapped content for parsing (first 100 chars): {wrapped_content[:100]}")
-
-        # Try to use 'lxml-xml' parser for XML content, fall back to 'html.parser' if not available
+        # Try to use 'html.parser'
         try:
-            soup = BeautifulSoup(wrapped_content, "html.parser")
-            #soup = BeautifulSoup(wrapped_content, "lxml-xml")
-            logger.debug("Successfully parsed with lxml-xml.")
+            soup = BeautifulSoup(decoded_content, "html.parser")
         except Exception as e:
-            logger.warning(f"Failed to use 'lxml-xml' parser: {e}. Falling back to 'html.parser'")
-            try:
-                soup = BeautifulSoup(wrapped_content, "html.parser")
-                logger.debug("Successfully parsed with html.parser.")
-            except Exception as e_html_parser:
-                logger.error(f"Failed to parse input content with html.parser either: {e_html_parser}")
-                return content # Return original content if all parsing fails
+            logger.warning(f"Failed to use 'html.parser' parser: {e}.")
     except Exception as e:
         logger.error(f"Failed to parse input content: {e}")
         return content  # Return original content as fallback
@@ -482,7 +466,7 @@ def convert_custom_tags_to_html(content: str, logger: logging.Logger) -> str:
                 tag.unwrap()
 
         # If we wrapped the content in a div, extract its contents
-        if wrapped_content.startswith('<div>') and wrapped_content.endswith('</div>'):
+        if decoded_content.startswith('<div>') and decoded_content.endswith('</div>'):
             # Get the contents of the div without pretty printing
             result = ''.join(str(c) for c in soup.div.contents)
             return result

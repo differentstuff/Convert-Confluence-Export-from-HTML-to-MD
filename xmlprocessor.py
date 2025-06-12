@@ -632,7 +632,7 @@ class XmlProcessor:
         # Update lookup dictionaries
         self._page_by_title[title] = blog_id
         self._page_by_title_space[f"{title}:{space_id}"] = blog_id
-        
+
     def _extract_attachments(self, root: ET.Element) -> None:
         """Extract attachments and link them to their page."""
         self.logger.info(f"Extracting attachments from XML")
@@ -894,7 +894,9 @@ class XmlProcessor:
             body = {
                 "id": body_id,
                 "body": "",
-                "bodyType": ""
+                "bodyType": "",
+                "content_class": "",
+                "content_id": ""
             }
 
             # Get body content
@@ -914,7 +916,9 @@ class XmlProcessor:
             if content_elem is not None:
                 content_id_elem = content_elem.find("./id[@name='id']")
                 if content_id_elem is not None and content_id_elem.text:
+                    # Store the id of the parent page
                     content_id = content_id_elem.text.strip()
+                    body["content_id"] = content_id
                     # Store the content class to determine how to handle it
                     content_class = content_elem.get("class")
                     body["content_class"] = content_class
@@ -924,7 +928,7 @@ class XmlProcessor:
         
         self.logger.info(f"Collected {len(body_page_relations)} body-page relationships")
         return body_page_relations
-    
+
     def _apply_body_page_relations(self, body_page_relations: List, page_dict: Dict) -> Tuple[int, int]:
         """
         Apply the collected body-content relationships to the appropriate objects.
@@ -939,14 +943,14 @@ class XmlProcessor:
             Tuple of (success_count, missing_count)
         """
         self.logger.info(f"Applying {len(body_page_relations)} body-page relationships")
-        
+
         success_count = 0
         missing_count = 0
-                
+
         # Process the body-content relationships
         for content_id, body in body_page_relations:
             content_class = body.get("content_class", "")
-            
+
             # Handle comments differently from pages/blog posts
             if "Comment" in content_class:
                 if hasattr(self, 'comments') and content_id in self.comments:
@@ -956,15 +960,15 @@ class XmlProcessor:
                 else:
                     missing_count += 1
                     self.logger.debug(f"Could not find comment '{content_id}' for body '{body['id']}'")
+            # Handle Pages and BlogPosts
             else:
-                # Handle Pages and BlogPosts
                 if content_id in page_dict:
                     page_dict[content_id]["bodypage"] = body
                     success_count += 1
                 else:
                     missing_count += 1
                     self.logger.debug(f"Could not find page '{content_id}' for body '{body['id']}'")
-        
+
         self.logger.info(f"Applied {success_count} relationships, {missing_count} pages/comments not found")
         return success_count, missing_count
 
@@ -987,7 +991,7 @@ class XmlProcessor:
                 self.logger.debug(f"Linked comment '{comment_id}' to page '{container_id}'")
 
         self.logger.debug(f"Linked {linked_count} comments to their parent pages")
-        
+
     def _build_helper_indexes(self) -> None:
         """Build helper indexes for faster lookups."""
         # Space key -> Space ID
@@ -1412,8 +1416,8 @@ class XmlProcessor:
         page_id = self._page_by_title.get(title)
         return self.page.get(page_id) if page_id else None
 
-    def get_all_related_page(self, page_id: str) -> dict:
-        """Get all page related to a specific page/blog post."""
+    def get_all_related_pages(self, page_id: str) -> dict:
+        """Get all pages related to a specific page or blog post."""
         page = self.get_page_by_id(page_id)
         if not page:
             return {}

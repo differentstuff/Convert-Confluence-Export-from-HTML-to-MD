@@ -14,6 +14,7 @@ FILENAME_PATTERN = re.compile(r'^(.+)_(\d+)(\.md)$')
 UNDERSCORE_DIGITS_PATTERN = re.compile(r'_\d+$')
 LINK_PATTERN = re.compile(r'\[([^\]]+)\]\(<?([^>)]+)>?\)')
 URL_PATTERN = re.compile(r'\[([^\]]+)\]\((https?://[^)]+)\)')
+URL_TIMEOUT = int(8)  # Timeout for web requests
 
 class LinkChecker:
     def __init__(self, config: Config, logger: logging.Logger, attachment_processor: AttachmentProcessor) -> None:
@@ -34,7 +35,7 @@ class LinkChecker:
         self.file_cache = {}     # Cache for file existence checks
         self.attachment_processor = attachment_processor
         self._build_file_cache()
-        
+
     def _build_file_cache(self) -> None:
         """Build cache of existing files in input and output directories"""
         for root, _, files in os.walk(self.output_folder):
@@ -127,7 +128,7 @@ class LinkChecker:
         # Return the path without checking existence - at this point in processing
         # the files may not exist yet, but we want to use the correct relative path
         return rel_path.replace(os.sep, '/'), True, "Path constructed from mapping"
-      
+
     def verify_web_url(self, url: str) -> Tuple[str, bool, str]:
         """Verify a web URL"""
         if url in self.checked_urls:
@@ -135,9 +136,9 @@ class LinkChecker:
 
         self.checked_urls.add(url)
         try:
-            response = self.session.head(url, timeout=10, allow_redirects=True)
+            response = self.session.head(url, timeout=URL_TIMEOUT, allow_redirects=True)
             if response.status_code == 405:  # Method not allowed, try GET
-                response = self.session.get(url, timeout=10)
+                response = self.session.get(url, timeout=URL_TIMEOUT)
 
             is_valid = 200 <= response.status_code < 400
             status = f"Status: {response.status_code}"
@@ -682,7 +683,7 @@ class LinkChecker:
                 if not link_path:
                     # Look for the attachment by filename across all attachments
                     filename = video['filename']
-                    decoded_filename = self.attachment_processor.xml_processor._sanitize_filename(filename)
+                    sanitized_filename = self.attachment_processor.xml_processor._sanitize_filename(filename)
                     
                     # Try to get page ID from the video source if available
                     if video['page_id']:
@@ -691,7 +692,7 @@ class LinkChecker:
                         attachments = self.attachment_processor.xml_processor.get_attachments_by_page_id(video['page_id'])
                         for att in attachments:
                             # Compare filename (case-insensitive) to handle encoding differences
-                            if att.get('title', '').lower() == filename.lower() or att.get('title', '').lower() == decoded_filename.lower():
+                            if att.get('title', '').lower() == filename.lower() or att.get('title', '').lower() == sanitized_filename.lower():
                                 parent_page_id = att.get('containerContent_id')
                                 space_key = self.attachment_processor.xml_processor.get_space_key_by_page_id(parent_page_id)
                                 link_path = f"{space_key}/attachments/{parent_page_id}/{att['title']}"
@@ -735,10 +736,10 @@ class LinkChecker:
         Updated markdown content with processed attachment links
         """
         self.logger.debug("Processing attachment links in markdown content")
-        
-        # First find all download paths - the most reliable identifier
-        download_pattern = re.compile(r'download/attachments/(\d+)/([^?]+)(?:\?[^>)]*)?')
-        
+
+        # First capture the markdown link structure
+        download_pattern = re.compile(r'download/attachments/(\d+)/([^)&>"\']+)(?:\?[^>)]*)?')
+
         # Pattern for direct attachment links
         attachment_pattern = re.compile(r'!\[(.*?)\]\((attachments/\d+/\d+\.[^)]+)\)|\[(.*?)\]\((attachments/\d+/\d+\.[^)]+)\)')
 
@@ -776,7 +777,7 @@ class LinkChecker:
                 else:
                     # Method 2: Try to find by filename in the page's attachments
                     filename = os.path.basename(link)
-                    decoded_filename = self.attachment_processor.xml_processor._sanitize_filename(filename)
+                    sanitized_filename = self.attachment_processor.xml_processor._sanitize_filename(filename)
                     
                     # First check attachments on the source page
                     attachments = self.attachment_processor.xml_processor.get_attachments_by_page_id(page_id)
@@ -784,7 +785,7 @@ class LinkChecker:
                     
                     for att in attachments:
                         # Compare filename (case-insensitive) to handle encoding differences
-                        if att.get('title', '').lower() == filename.lower() or att.get('title', '').lower() == decoded_filename.lower():
+                        if att.get('title', '').lower() == filename.lower() or att.get('title', '').lower() == sanitized_filename.lower():
                             parent_page_id = att.get('containerContent_id')
                             space_key = self.attachment_processor.xml_processor.get_space_key_by_page_id(parent_page_id)
                             new_link = f"{space_key}/attachments/{parent_page_id}/{att['title']}"
@@ -871,20 +872,13 @@ class LinkChecker:
                 
                 # Get space key for page
                 space_key = self.attachment_processor.xml_processor.get_space_key_by_page_id(attachment_page_id)
-                
-                # Decode filename using the XML processor's function
-                decoded_filename = self.attachment_processor.xml_processor._sanitize_filename(filename)
-    
+                    
                 # Look for the attachment in XML data by filename and page ID
                 attachment = None
                 attachments = self.attachment_processor.xml_processor.get_attachments_by_page_id(attachment_page_id)
                 for att in attachments:
                     if att.get('title', '') == filename:
                         self.logger.debug(f"Attachment found by filename: {filename}")
-                        attachment = att
-                        break
-                    if att.get('title', '') == decoded_filename:
-                        self.logger.debug(f"Attachment found by decoded filename: {decoded_filename}")
                         attachment = att
                         break
                 
@@ -900,8 +894,8 @@ class LinkChecker:
                     self.logger.debug(f"Found attachment filename: {filename}")
                 else:
                     # Create the new clean link path with the original filename
-                    new_link = f"{space_key}/attachments/{attachment_page_id}/{decoded_filename or filename}"
-                    self.logger.debug(f"No attachment found, using original filename: {decoded_filename or filename}")
+                    new_link = f"{space_key}/attachments/{attachment_page_id}/{filename}"
+                    self.logger.debug(f"No attachment found, using filename: {filename}")
 
                 # Determine if this is a special link that should have no description
                 is_thumbnail = "rest/documentConversion/latest/conversion/thumbnail" in full_link

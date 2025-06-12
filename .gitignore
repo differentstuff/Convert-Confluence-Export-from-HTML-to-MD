@@ -6,7 +6,9 @@ __pycache__/*
 
 # dirs
 in/
+in*/
 out/
 out*/
-in*/
-
+logs/
+test/
+tests/

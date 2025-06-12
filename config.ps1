@@ -50,13 +50,13 @@
 
     ## Sections to remove
     SectionsToRemove = @(
-        #"#  Space Details", # Do not allow this! will produce errors!
+        #"#  Space Details", # Do not uncomment this line! will produce errors!
         "# Zusatzinformation auf Filesystem",
         "## Verwandte Artikel",
         "## Attachments",
         "## Space contributors",
         "## Recent space activity",
-        "## KÃ¼rzlich aktualisierte Artikel",
+        "## Kürzlich aktualisierte Artikel",
         "## Nach Thema durchsuchen"
     )
     ### Do not include "#  Space Details" Section in SectionsToRemove
@@ -107,6 +107,8 @@ author: [username]
 dateCreated: [date_created]
 up:
   - "[[up_field]]"
+tags:
+  - ""
 ---
 "@
 
@@ -120,6 +122,8 @@ dateCreated: [date_created]
 type: blogpost
 up:
   - "[[up_field]]"
+tags:
+  - ""
 ---
 "@
 
