@@ -48,14 +48,15 @@ A specialized Python tool for converting Confluence HTML exports to Markdown for
 ## Installation
 ```powershell
 # 1. Clone & install
-git clone https://github.com/your/repo.git
+git clone https://github.com/differentstuff/Convert-Confluence-Export-from-HTML-to-MD.git
+cd Convert-Confluence-Export-from-HTML-to-MD
 .\install.bat
 
 # 2. Add your exports
 📂 input/         ← HTML exports here
 📂 input-xml/     ← XML exports here
 
-# 3. Convert!
+# 3. Convert
 .\run.bat
 
 The installer will:
@@ -64,14 +65,16 @@ The installer will:
 - Set up input/output directories
 
 ## Usage
-1. Export your Confluence space/pages as HTML
+1. Export your Confluence space/pages as HTML and XML
 2. Copy the exported files to the `input` and `input-xml` directory 
   - Can be in root or subdirectory
   - Use one dir for each space (unzipped confluence export)
-3. Change Configuration in `.\convert.ps1` (Line 2-4)
+3. Change Configuration in `.\config.ps1` (see 'Custom Options' in Line 45-130)
 4. Run the converter:
    - Double-click `run.bat`
    - OR: Execute with PowerShell: `.\convert.ps1`
+
+Depending on your input size the conversion will take several minutes (estimate 15 Min for 10k files (20GB of attachments)).
 
 ### Command Line Options
 
@@ -93,7 +96,6 @@ Edit `convert.ps1` to customize:
 $inputFolder = "path/to/input"
 $outputFolder = "path/to/output"
 $CONFLUENCE_BASE_URL = "https://your-confluence-url"
-$RENAME_ALL = $true  # Set to false to keep original filenames
 ```
 
 
@@ -152,18 +154,19 @@ Some elements are not included in the Confluence export by design, which affects
 
 **Missing Elements**
 The following items are not part of the HTML export:
-  - Blog post entries
   - Label management pages
   - User profile directories
 
 **Impact on Conversion**:
   - Missing elements result in empty Markdown files
-  - Some files may be renamed to 'viewlabel.md'
+  - Some files may be renamed to 'viewlabel.md' if their source does not exist
   - Links to non-exported content may redirect to wrong or empty pages
   - Certain dynamic content cannot be preserved
 
 These limitations are inherent to Confluence's export functionality and cannot be addressed by the conversion script. 
 Users should be aware that manual cleanup might be needed for these cases.
+
+A cleanup using a Linter is recommended after the conversion.
 
 ### Workarounds
 - Review 'viewlabel.md' files after conversion
